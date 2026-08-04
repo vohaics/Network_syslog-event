@@ -7,7 +7,8 @@ enables 'terminal monitor', detects interface / BGP / OSPF down events,
 sends email alerts, and provides a web dashboard.
 
 Features:
-- Multi-device support
+- Import device inventory from CSV / JSON (IP + credentials)
+- Search inventory, then Connect / Stop monitoring on demand
 - Add / remove devices from the web UI (saved to devices.json)
 - Email notifications
 - Browser sound notification (toggleable)
@@ -68,9 +69,13 @@ DASHBOARD_PORT = 5000
 
 # Shared state
 events = deque(maxlen=500)
+# Inventory list (source of truth in devices.json)
+inventory_lock = threading.Lock()
+# Live monitor state keyed by device name
 device_status = {}
 device_threads = {}
 stop_flags = {}
+status_lock = threading.Lock()
 
 app = Flask(__name__)
 app.secret_key = "change-this-to-a-long-random-string-please-32chars-min"
@@ -94,6 +99,113 @@ def load_devices():
 def save_devices(devices):
     with open(DEVICES_FILE, "w") as f:
         json.dump(devices, f, indent=2)
+
+def normalize_device(raw: dict) -> dict:
+    """Normalize a device dict from UI / CSV / JSON import."""
+    name = str(raw.get("name") or raw.get("hostname") or "").strip()
+    host = str(raw.get("host") or raw.get("ip") or raw.get("address") or "").strip()
+    if not name and host:
+        name = host
+    if not host:
+        raise ValueError("host/ip required")
+    if not name:
+        raise ValueError("name required")
+
+    port = raw.get("port", 23)
+    try:
+        port = int(port) if str(port).strip() else 23
+    except (TypeError, ValueError):
+        port = 23
+
+    username = str(raw.get("username") or raw.get("user") or "").strip()
+    password = str(raw.get("password") or raw.get("pass") or "")
+    enable_password = str(
+        raw.get("enable_password") or raw.get("enable") or raw.get("enable_pass") or ""
+    )
+
+    if not username or not password:
+        raise ValueError(f"username/password required for {name}")
+
+    return {
+        "name": name,
+        "host": host,
+        "port": port,
+        "username": username,
+        "password": password,
+        "enable_password": enable_password,
+    }
+
+def parse_devices_csv(text: str):
+    """Parse CSV inventory. Flexible header names."""
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise ValueError("CSV has no header row")
+    # Normalize headers
+    field_map = {}
+    for h in reader.fieldnames:
+        key = (h or "").strip().lower().replace(" ", "_")
+        field_map[h] = key
+
+    devices = []
+    for row in reader:
+        if not any((v or "").strip() for v in row.values()):
+            continue
+        mapped = {field_map[k]: (v or "").strip() for k, v in row.items() if k is not None}
+        devices.append(normalize_device(mapped))
+    return devices
+
+def parse_devices_json(text: str):
+    data = json.loads(text)
+    if isinstance(data, dict):
+        data = data.get("devices") or data.get("networklist") or data.get("hosts") or []
+    if not isinstance(data, list):
+        raise ValueError("JSON must be a list of devices or {devices:[...]}")
+    return [normalize_device(item) for item in data]
+
+def upsert_devices(incoming: list):
+    """Merge imported devices into inventory by name (overwrite credentials/host)."""
+    with inventory_lock:
+        devices = load_devices()
+        by_name = {d["name"]: i for i, d in enumerate(devices)}
+        added, updated = 0, 0
+        for dev in incoming:
+            if dev["name"] in by_name:
+                devices[by_name[dev["name"]]] = dev
+                updated += 1
+            else:
+                by_name[dev["name"]] = len(devices)
+                devices.append(dev)
+                added += 1
+        save_devices(devices)
+        return {"ok": True, "added": added, "updated": updated, "total": len(devices)}
+
+def find_device(name: str):
+    with inventory_lock:
+        for d in load_devices():
+            if d["name"] == name:
+                return d
+    return None
+
+def inventory_public():
+    """Inventory without passwords for the UI."""
+    with inventory_lock:
+        devices = load_devices()
+    out = []
+    for d in devices:
+        with status_lock:
+            st = device_status.get(d["name"], {})
+            monitoring = d["name"] in stop_flags and not stop_flags[d["name"]].is_set()
+        out.append({
+            "name": d["name"],
+            "host": d["host"],
+            "port": d.get("port", 23),
+            "username": d.get("username", ""),
+            "monitoring": monitoring,
+            "connected": bool(st.get("connected")),
+            "last_keepalive": st.get("last_keepalive", "-"),
+            "last_event": st.get("last_event", "-"),
+        })
+    return out
 
 # -------------------- Login Page --------------------
 LOGIN_HTML = """
@@ -143,7 +255,7 @@ DASHBOARD_HTML = """
     :root {
         --bg: #0f172a; --card: #1e293b; --border: #334155;
         --text: #e2e8f0; --muted: #94a3b8;
-        --green: #22c55e; --red: #ef4444; --blue: #3b82f6;
+        --green: #22c55e; --red: #ef4444; --blue: #3b82f6; --amber: #f59e0b;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); padding: 20px; }
@@ -155,23 +267,33 @@ DASHBOARD_HTML = """
     .btn-sm { background: var(--card); border: 1px solid var(--border); color: var(--text); padding: 6px 12px; border-radius: 8px; font-size: 0.85rem; cursor: pointer; }
     .btn-sm:hover { background: #334155; }
     .btn-sm.active { background: var(--blue); border-color: var(--blue); color: white; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px; margin-bottom: 22px; }
+    .btn-sm.danger { color: #f87171; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; margin-bottom: 22px; }
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 16px; position: relative; }
-    .card h3 { font-size: 1.05rem; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
-    .status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+    .card h3 { font-size: 1.05rem; margin-bottom: 8px; display: flex; align-items: center; gap: 8px; padding-right: 70px; }
+    .status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
     .status-dot.up { background: var(--green); box-shadow: 0 0 8px var(--green); }
     .status-dot.down { background: var(--red); box-shadow: 0 0 8px var(--red); }
+    .status-dot.idle { background: #64748b; }
     .meta { font-size: 0.8rem; color: var(--muted); margin-top: 4px; }
     .meta span { color: var(--text); }
+    .card-actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
     .btn-remove { position: absolute; top: 10px; right: 10px; background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 6px; padding: 2px 8px; font-size: 0.72rem; cursor: pointer; }
     .btn-remove:hover { background: var(--red); color: white; border-color: var(--red); }
     .form-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 18px; margin-bottom: 22px; }
     .form-card h3 { margin-bottom: 12px; font-size: 1.05rem; }
+    .form-card p.hint { color: var(--muted); font-size: 0.82rem; margin: -6px 0 12px; }
     .form-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 12px; }
-    input { background: #0f172a; border: 1px solid var(--border); color: var(--text); padding: 9px 11px; border-radius: 8px; font-size: 0.9rem; width: 100%; }
-    input:focus { outline: none; border-color: var(--blue); }
+    .toolbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+    .toolbar input[type="search"] { flex: 1; min-width: 200px; }
+    input, textarea { background: #0f172a; border: 1px solid var(--border); color: var(--text); padding: 9px 11px; border-radius: 8px; font-size: 0.9rem; width: 100%; }
+    input:focus, textarea:focus { outline: none; border-color: var(--blue); }
     .btn { background: var(--blue); color: white; border: none; padding: 10px 18px; border-radius: 8px; font-size: 0.9rem; cursor: pointer; font-weight: 500; }
     .btn:hover { opacity: 0.9; }
+    .btn.secondary { background: #334155; }
+    .btn.success { background: #15803d; }
+    .btn.warn { background: #b45309; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
     .events-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
     .events-header { padding: 12px 18px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px; }
     .filter-select { background: #0f172a; border: 1px solid var(--border); color: var(--text); padding: 6px 10px; border-radius: 6px; font-size: 0.85rem; }
@@ -182,6 +304,12 @@ DASHBOARD_HTML = """
     .time { color: var(--muted); white-space: nowrap; width: 145px; }
     .device-tag { display: inline-block; background: #1e3a5f; color: #93c5fd; padding: 2px 7px; border-radius: 4px; font-size: 0.7rem; }
     .empty { text-align: center; padding: 40px; color: var(--muted); }
+    .import-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .import-row input[type="file"] { max-width: 280px; }
+    .msg { font-size: 0.85rem; color: var(--muted); margin-top: 8px; }
+    .msg.ok { color: var(--green); }
+    .msg.err { color: var(--red); }
+    .count-badge { color: var(--muted); font-size: 0.85rem; }
     @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } .form-row { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -193,12 +321,33 @@ DASHBOARD_HTML = """
             <button class="btn-sm" id="sound-btn" onclick="toggleSound()">Sound: ON</button>
             <a href="/export" class="btn-sm" style="text-decoration:none;">Export CSV</a>
             <div class="badge" id="last-update">Loading...</div>
-            <a href="/logout" class="btn-sm" style="text-decoration:none;color:#f87171;">Logout</a>
+            <a href="/logout" class="btn-sm danger" style="text-decoration:none;">Logout</a>
         </div>
     </header>
 
     <div class="form-card">
-        <h3>Add New Device</h3>
+        <h3>Import Network List</h3>
+        <p class="hint">Upload CSV or JSON with IP + username/password. Devices are stored in inventory — connect only when you need to monitor syslog.</p>
+        <div class="import-row">
+            <input type="file" id="import-file" accept=".csv,.json,text/csv,application/json">
+            <button class="btn secondary" onclick="importFile()">Import File</button>
+            <a href="/sample/networklist.csv" class="btn-sm" style="text-decoration:none;">Sample CSV</a>
+        </div>
+        <div class="msg" id="import-msg"></div>
+    </div>
+
+    <div class="form-card">
+        <h3>Device Inventory</h3>
+        <div class="toolbar">
+            <input type="search" id="search-q" placeholder="Search by name, IP, or username..." oninput="applySearch()">
+            <span class="count-badge" id="inv-count">0 devices</span>
+        </div>
+        <div class="grid" id="devices"></div>
+        <div class="empty" id="devices-empty" style="display:none;">No devices yet — import a network list or add one below.</div>
+    </div>
+
+    <div class="form-card">
+        <h3>Add Single Device</h3>
         <div class="form-row">
             <input id="f-name" placeholder="Name (e.g. Core-Router)" required>
             <input id="f-host" placeholder="IP / Hostname" required>
@@ -209,8 +358,6 @@ DASHBOARD_HTML = """
         </div>
         <button class="btn" onclick="addDevice()">+ Add Device</button>
     </div>
-
-    <div class="grid" id="devices"></div>
 
     <div class="events-card">
         <div class="events-header">
@@ -236,6 +383,7 @@ DASHBOARD_HTML = """
 <script>
 let lastEventCount = 0;
 let allEvents = [];
+let allInventory = [];
 let soundEnabled = localStorage.getItem('soundEnabled') !== 'false';
 
 const audio = new Audio("data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdH2Onp+gnZ2dm5qZmJeXl5aVlZSTk5KRkZCPj46NjYyLi4qJiYiHh4aFhYSDgoGAf39+fX18e3t6eXl4d3d2dXV0c3NycnFwcG9vbm1tbGxra2pqaWloaGdnZmVlZGRjY2JiYWFgX19eXl1dXFxbW1paWVlYWFdXVlZVVVRUU1NSUlFRUFBPTk5NTUxLS0pKSUlISEdHRkZFRURDQ0JCQUFAPz8+Pj09PDw7Ozo6OTk4ODc3NjY1NTQ0MzMyMjExMDAvLy4uLS0sLCsrKioqKSkpKCgoJycnJiYmJSUlJCQkIyMjIiIiISEhICAgHx8fHh4eHR0dHBwcGxsbGhoaGRkZGBgYFxcXFhYWFRUVFBQUExMTEhISERER");
@@ -259,40 +407,95 @@ function playSound() {
     audio.play().catch(() => {});
 }
 
-function render(data) {
-    const devicesEl = document.getElementById('devices');
-    devicesEl.innerHTML = '';
-    const filterSelect = document.getElementById('filter-device');
-    const currentOptions = Array.from(filterSelect.options).map(o => o.value);
+function statusLabel(d) {
+    if (d.connected) return { text: 'Connected', color: 'var(--green)', dot: 'up' };
+    if (d.monitoring) return { text: 'Reconnecting…', color: 'var(--amber)', dot: 'down' };
+    return { text: 'Idle', color: 'var(--muted)', dot: 'idle' };
+}
 
-    for (const [name, s] of Object.entries(data.devices)) {
+function renderInventory(list) {
+    const devicesEl = document.getElementById('devices');
+    const emptyEl = document.getElementById('devices-empty');
+    const filterSelect = document.getElementById('filter-device');
+    const currentFilter = filterSelect.value;
+    devicesEl.innerHTML = '';
+
+    document.getElementById('inv-count').textContent = list.length + ' shown / ' + allInventory.length + ' total';
+
+    if (list.length === 0) {
+        emptyEl.style.display = 'block';
+        emptyEl.textContent = allInventory.length === 0
+            ? 'No devices yet — import a network list or add one below.'
+            : 'No devices match your search.';
+    } else {
+        emptyEl.style.display = 'none';
+    }
+
+    // Rebuild filter options from full inventory
+    const keep = new Set(['all']);
+    filterSelect.innerHTML = '<option value="all">All devices</option>';
+    allInventory.forEach(d => {
+        const opt = document.createElement('option');
+        opt.value = d.name;
+        opt.textContent = d.name;
+        filterSelect.appendChild(opt);
+        keep.add(d.name);
+    });
+    if (keep.has(currentFilter)) filterSelect.value = currentFilter;
+
+    list.forEach(d => {
+        const st = statusLabel(d);
         const div = document.createElement('div');
         div.className = 'card';
+        const monBtn = d.monitoring
+            ? `<button class="btn btn-sm warn" onclick="stopMonitor('${escapeAttr(d.name)}')">Stop</button>`
+            : `<button class="btn btn-sm success" onclick="startMonitor('${escapeAttr(d.name)}')">Connect & Monitor</button>`;
         div.innerHTML = `
-            <button class="btn-remove" onclick="removeDevice('${name}')">Remove</button>
-            <h3><span class="status-dot ${s.connected ? 'up' : 'down'}"></span>${name}</h3>
-            <div class="meta">Host: <span>${s.host}</span></div>
-            <div class="meta">Status: <span style="color:${s.connected ? 'var(--green)' : 'var(--red)'}">${s.connected ? 'Connected' : 'Disconnected'}</span></div>
-            <div class="meta">Last keepalive: <span>${s.last_keepalive}</span></div>
-            <div class="meta">Last event: <span>${s.last_event}</span></div>
+            <button class="btn-remove" onclick="removeDevice('${escapeAttr(d.name)}')">Remove</button>
+            <h3><span class="status-dot ${st.dot}"></span>${escapeHtml(d.name)}</h3>
+            <div class="meta">Host: <span>${escapeHtml(d.host)}:${d.port}</span></div>
+            <div class="meta">User: <span>${escapeHtml(d.username)}</span></div>
+            <div class="meta">Status: <span style="color:${st.color}">${st.text}</span></div>
+            <div class="meta">Last keepalive: <span>${escapeHtml(d.last_keepalive)}</span></div>
+            <div class="meta">Last event: <span>${escapeHtml(d.last_event)}</span></div>
+            <div class="card-actions">${monBtn}</div>
         `;
         devicesEl.appendChild(div);
+    });
+}
 
-        if (!currentOptions.includes(name)) {
-            const opt = document.createElement('option');
-            opt.value = name;
-            opt.textContent = name;
-            filterSelect.appendChild(opt);
-        }
+function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function escapeAttr(s) {
+    return String(s).replace(/\\\\/g, '\\\\\\\\').replace(/'/g, "\\\\'");
+}
+
+function applySearch() {
+    const q = (document.getElementById('search-q').value || '').trim().toLowerCase();
+    if (!q) {
+        renderInventory(allInventory);
+        return;
     }
+    const filtered = allInventory.filter(d =>
+        d.name.toLowerCase().includes(q) ||
+        d.host.toLowerCase().includes(q) ||
+        (d.username || '').toLowerCase().includes(q)
+    );
+    renderInventory(filtered);
+}
 
-    allEvents = data.events;
+function render(data) {
+    allInventory = data.inventory || [];
+    applySearch();
+
+    allEvents = data.events || [];
     applyFilter();
 
-    if (data.events.length > lastEventCount && lastEventCount > 0) {
+    if (allEvents.length > lastEventCount && lastEventCount > 0) {
         playSound();
     }
-    lastEventCount = data.events.length;
+    lastEventCount = allEvents.length;
 
     document.getElementById('last-update').textContent = 'Updated: ' + new Date().toLocaleTimeString();
 }
@@ -310,7 +513,7 @@ function applyFilter() {
         tbody.innerHTML = '';
         filtered.forEach(e => {
             const tr = document.createElement('tr');
-            tr.innerHTML = `<td class="time">${e.time}</td><td><span class="device-tag">${e.device}</span></td><td>${e.msg}</td>`;
+            tr.innerHTML = `<td class="time">${escapeHtml(e.time)}</td><td><span class="device-tag">${escapeHtml(e.device)}</span></td><td>${escapeHtml(e.msg)}</td>`;
             tbody.appendChild(tr);
         });
         count.textContent = filtered.length + ' events';
@@ -323,6 +526,36 @@ async function refresh() {
         const data = await r.json();
         render(data);
     } catch (e) { console.error(e); }
+}
+
+async function importFile() {
+    const fileInput = document.getElementById('import-file');
+    const msg = document.getElementById('import-msg');
+    if (!fileInput.files || !fileInput.files[0]) {
+        msg.className = 'msg err';
+        msg.textContent = 'Choose a CSV or JSON file first.';
+        return;
+    }
+    const fd = new FormData();
+    fd.append('file', fileInput.files[0]);
+    msg.className = 'msg';
+    msg.textContent = 'Importing…';
+    try {
+        const r = await fetch('/api/devices/import', { method: 'POST', body: fd });
+        const res = await r.json();
+        if (res.ok) {
+            msg.className = 'msg ok';
+            msg.textContent = `Imported: ${res.added} added, ${res.updated} updated (${res.total} total). Search and click Connect & Monitor when needed.`;
+            fileInput.value = '';
+            refresh();
+        } else {
+            msg.className = 'msg err';
+            msg.textContent = res.error || 'Import failed';
+        }
+    } catch (e) {
+        msg.className = 'msg err';
+        msg.textContent = String(e);
+    }
 }
 
 async function addDevice() {
@@ -353,8 +586,22 @@ async function addDevice() {
     }
 }
 
+async function startMonitor(name) {
+    const r = await fetch('/api/devices/' + encodeURIComponent(name) + '/monitor', { method: 'POST' });
+    const res = await r.json();
+    if (!res.ok) alert(res.error || 'Failed to start monitor');
+    refresh();
+}
+
+async function stopMonitor(name) {
+    const r = await fetch('/api/devices/' + encodeURIComponent(name) + '/stop', { method: 'POST' });
+    const res = await r.json();
+    if (!res.ok) alert(res.error || 'Failed to stop');
+    refresh();
+}
+
 async function removeDevice(name) {
-    if (!confirm(`Remove device "${name}"?`)) return;
+    if (!confirm(`Remove device "${name}" from inventory?`)) return;
     const r = await fetch('/api/devices/' + encodeURIComponent(name), { method: 'DELETE' });
     const res = await r.json();
     if (res.ok) refresh();
@@ -366,6 +613,12 @@ setInterval(refresh, 3000);
 </script>
 </body>
 </html>
+"""
+
+SAMPLE_CSV = """name,host,port,username,password,enable_password
+Core-Router,192.168.1.1,23,admin,cisco123,
+Edge-Switch,192.168.1.2,23,admin,cisco123,enablepass
+Branch-RTR,10.0.0.1,23,netops,secret,
 """
 
 # -------------------- Routes --------------------
@@ -390,48 +643,121 @@ def logout():
 def index():
     return render_template_string(DASHBOARD_HTML)
 
+@app.route("/sample/networklist.csv")
+@login_required
+def sample_csv():
+    return Response(
+        SAMPLE_CSV,
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment;filename=networklist_sample.csv"}
+    )
+
 @app.route("/api/status")
 @login_required
 def api_status():
     return jsonify({
-        "devices": device_status,
+        "inventory": inventory_public(),
         "events": list(events)[:120]
     })
+
+@app.route("/api/devices", methods=["GET"])
+@login_required
+def api_list_devices():
+    q = (request.args.get("q") or "").strip().lower()
+    items = inventory_public()
+    if q:
+        items = [
+            d for d in items
+            if q in d["name"].lower() or q in d["host"].lower() or q in (d.get("username") or "").lower()
+        ]
+    return jsonify({"ok": True, "devices": items})
+
+@app.route("/api/devices/import", methods=["POST"])
+@login_required
+def api_import_devices():
+    try:
+        if "file" in request.files and request.files["file"].filename:
+            f = request.files["file"]
+            raw = f.read().decode("utf-8-sig", errors="replace")
+            name = (f.filename or "").lower()
+            if name.endswith(".json"):
+                devices = parse_devices_json(raw)
+            else:
+                devices = parse_devices_csv(raw)
+        elif request.is_json:
+            body = request.get_json(force=True)
+            if isinstance(body, list):
+                devices = [normalize_device(x) for x in body]
+            elif isinstance(body, dict) and "devices" in body:
+                devices = [normalize_device(x) for x in body["devices"]]
+            elif isinstance(body, dict) and "csv" in body:
+                devices = parse_devices_csv(body["csv"])
+            else:
+                return jsonify({"ok": False, "error": "Send file upload, JSON list, or {devices:[...]}"})
+        else:
+            return jsonify({"ok": False, "error": "No file or JSON body provided"})
+
+        if not devices:
+            return jsonify({"ok": False, "error": "No devices found in import"})
+        return jsonify(upsert_devices(devices))
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
 
 @app.route("/api/devices", methods=["POST"])
 @login_required
 def api_add_device():
-    data = request.json
-    name = data.get("name", "").strip()
-    if not name:
-        return jsonify({"ok": False, "error": "Name required"})
-    if name in device_status:
-        return jsonify({"ok": False, "error": "Device name already exists"})
+    try:
+        data = request.json or {}
+        new_dev = normalize_device(data)
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)})
 
-    devices = load_devices()
-    new_dev = {
-        "name": name,
-        "host": data["host"].strip(),
-        "port": int(data.get("port", 23)),
-        "username": data["username"].strip(),
-        "password": data["password"],
-        "enable_password": data.get("enable_password", "")
-    }
-    devices.append(new_dev)
-    save_devices(devices)
-    start_device_monitor(new_dev)
+    with inventory_lock:
+        devices = load_devices()
+        if any(d["name"] == new_dev["name"] for d in devices):
+            return jsonify({"ok": False, "error": "Device name already exists"})
+        devices.append(new_dev)
+        save_devices(devices)
+
+    # Inventory only — do not auto-connect (user clicks Connect & Monitor)
+    return jsonify({"ok": True})
+
+@app.route("/api/devices/<name>/monitor", methods=["POST"])
+@login_required
+def api_start_monitor(name):
+    dev = find_device(name)
+    if not dev:
+        return jsonify({"ok": False, "error": "Device not found in inventory"})
+    if name in stop_flags and not stop_flags[name].is_set():
+        return jsonify({"ok": True, "message": "Already monitoring"})
+    start_device_monitor(dev)
+    return jsonify({"ok": True})
+
+@app.route("/api/devices/<name>/stop", methods=["POST"])
+@login_required
+def api_stop_monitor(name):
+    if name in stop_flags:
+        stop_flags[name].set()
+    with status_lock:
+        if name in device_status:
+            device_status[name]["connected"] = False
+            device_status[name]["last_keepalive"] = "-"
+    device_threads.pop(name, None)
+    # Keep last status entry for UI until removed from inventory
     return jsonify({"ok": True})
 
 @app.route("/api/devices/<name>", methods=["DELETE"])
 @login_required
 def api_remove_device(name):
-    devices = load_devices()
-    devices = [d for d in devices if d["name"] != name]
-    save_devices(devices)
+    with inventory_lock:
+        devices = load_devices()
+        devices = [d for d in devices if d["name"] != name]
+        save_devices(devices)
 
     if name in stop_flags:
         stop_flags[name].set()
-    device_status.pop(name, None)
+    with status_lock:
+        device_status.pop(name, None)
     device_threads.pop(name, None)
     stop_flags.pop(name, None)
     return jsonify({"ok": True})
@@ -469,8 +795,9 @@ def send_email(subject: str, body: str):
 def add_event(device_name: str, msg: str):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     events.appendleft({"time": now, "device": device_name, "msg": msg})
-    if device_name in device_status:
-        device_status[device_name]["last_event"] = now
+    with status_lock:
+        if device_name in device_status:
+            device_status[device_name]["last_event"] = now
     send_email(f"[Cisco Alert] {device_name}", f"Device : {device_name}\nTime   : {now}\n\n{msg}")
 
 # -------------------- Monitor --------------------
@@ -479,12 +806,13 @@ def monitor_device(dev: dict, stop_event: threading.Event):
     tn = None
     last_keepalive = 0
 
-    device_status[name] = {
-        "connected": False,
-        "last_keepalive": "-",
-        "last_event": "-",
-        "host": dev["host"]
-    }
+    with status_lock:
+        device_status[name] = {
+            "connected": False,
+            "last_keepalive": "-",
+            "last_event": device_status.get(name, {}).get("last_event", "-"),
+            "host": dev["host"]
+        }
 
     while not stop_event.is_set():
         try:
@@ -511,7 +839,8 @@ def monitor_device(dev: dict, stop_event: threading.Event):
                 time.sleep(0.3)
                 tn.read_very_eager()
 
-                device_status[name]["connected"] = True
+                with status_lock:
+                    device_status[name]["connected"] = True
                 print(f"[{name}] Connected + terminal monitor ON")
 
             data = tn.read_very_eager().decode(errors="ignore")
@@ -529,13 +858,16 @@ def monitor_device(dev: dict, stop_event: threading.Event):
             if time.time() - last_keepalive > KEEPALIVE_INTERVAL:
                 tn.write(b"\n")
                 last_keepalive = time.time()
-                device_status[name]["last_keepalive"] = datetime.now().strftime("%H:%M:%S")
+                with status_lock:
+                    device_status[name]["last_keepalive"] = datetime.now().strftime("%H:%M:%S")
 
             time.sleep(0.35)
 
         except Exception as e:
             print(f"[{name}] Lost: {e}")
-            device_status[name]["connected"] = False
+            with status_lock:
+                if name in device_status:
+                    device_status[name]["connected"] = False
             try:
                 if tn:
                     tn.close()
@@ -552,10 +884,17 @@ def monitor_device(dev: dict, stop_event: threading.Event):
             tn.close()
     except Exception:
         pass
+    with status_lock:
+        if name in device_status:
+            device_status[name]["connected"] = False
     print(f"[{name}] Monitor stopped")
 
 def start_device_monitor(dev: dict):
     name = dev["name"]
+    # Stop previous thread if any
+    if name in stop_flags and not stop_flags[name].is_set():
+        stop_flags[name].set()
+        time.sleep(0.2)
     stop_event = threading.Event()
     stop_flags[name] = stop_event
     t = threading.Thread(target=monitor_device, args=(dev, stop_event), daemon=True)
@@ -564,11 +903,10 @@ def start_device_monitor(dev: dict):
 
 # -------------------- Main --------------------
 if __name__ == "__main__":
-    devices = load_devices()
-    for d in devices:
-        start_device_monitor(d)
-
+    # Inventory loads from devices.json; monitoring starts only when user clicks Connect
+    n = len(load_devices())
     print(f"\nDashboard → http://0.0.0.0:{DASHBOARD_PORT}")
     print(f"Login     → user: {DASHBOARD_USER}  /  pass: {DASHBOARD_PASS}")
+    print(f"Inventory → {n} device(s) loaded (idle until Connect & Monitor)")
     print("Press Ctrl+C to stop\n")
     app.run(host="0.0.0.0", port=DASHBOARD_PORT, debug=False, use_reloader=False)

@@ -10,6 +10,8 @@ It keeps persistent Telnet sessions, enables `terminal monitor`, watches for cri
 
 | Feature | Description |
 |---------|-------------|
+| Import network list | Upload CSV/JSON with IP + username/password into inventory |
+| Search + on-demand connect | Search inventory, then **Connect & Monitor** only when needed |
 | Multi-device | Monitor many Cisco routers/switches at the same time |
 | Add / Remove devices | From the web UI – no need to edit code |
 | Persistent storage | Devices saved in `devices.json` |
@@ -72,7 +74,59 @@ python cisco_multi_monitor.py
 http://YOUR_SERVER_IP:5000
 ```
 
-5. Login with the credentials you set, then add your Cisco devices using the form.
+5. Login with the credentials you set, then **import your network list** (or add devices one-by-one).
+6. Use the search box to find a device, click **Connect & Monitor** to open Telnet + `terminal monitor` and watch syslog events.
+
+---
+
+## Import Network List (CSV / JSON)
+
+Inventory is stored in `devices.json`. Importing does **not** connect yet — search and click **Connect & Monitor** when you need syslog watching.
+
+### CSV (recommended)
+
+Header row required. Column names are flexible (`host`/`ip`, `username`/`user`, `password`/`pass`, etc.):
+
+```csv
+name,host,port,username,password,enable_password
+Core-Router,192.168.1.1,23,admin,cisco123,
+Edge-Switch,192.168.1.2,23,admin,cisco123,enablepass
+```
+
+Upload via the dashboard **Import Network List** section, or:
+
+```bash
+curl -b cookies.txt -F "file=@networklist.csv" http://YOUR_SERVER:5000/api/devices/import
+```
+
+A sample file is also available from the dashboard: **Sample CSV**.
+
+### JSON
+
+```json
+[
+  {
+    "name": "Core-Router",
+    "host": "192.168.1.1",
+    "port": 23,
+    "username": "admin",
+    "password": "cisco123",
+    "enable_password": ""
+  }
+]
+```
+
+---
+
+## Tera Term and this tool
+
+**Yes — using Tera Term is OK.**
+
+- This monitor opens its **own** Telnet session (separate from Tera Term).
+- You can keep using Tera Term for manual CLI work while the dashboard monitors syslog.
+- Use the **same username/password** from your network list in both tools.
+- Cisco devices usually allow multiple VTY (Telnet) sessions; if you hit “no more connections”, free a VTY line or raise `line vty` limits on the device.
+- This tool uses **Telnet only** (not SSH). If the device only allows SSH, use Tera Term over SSH for manual access, and adapt this script (e.g. `paramiko` / `netmiko`) for monitoring.
 
 ---
 
@@ -118,19 +172,18 @@ You can add or remove patterns in the `PATTERNS` list inside the script.
 
 ## Adding Devices
 
-### From the Web UI (recommended)
+### Import network list (recommended for many devices)
 
 1. Login to the dashboard.
-2. Fill in the **Add New Device** form:
-   - Name (unique)
-   - IP / Hostname
-   - Port (default 23)
-   - Username
-   - Password
-   - Enable password (optional)
-3. Click **+ Add Device**.
+2. Upload your CSV/JSON under **Import Network List**.
+3. Search for a device → click **Connect & Monitor**.
+4. Click **Stop** when you no longer need that session.
 
-The device is saved to `devices.json` and monitoring starts immediately.
+### Add one device from the Web UI
+
+1. Fill in the **Add Single Device** form (name, IP, port, username, password, optional enable).
+2. Click **+ Add Device** (saved to inventory as idle).
+3. Click **Connect & Monitor** when you want syslog watching.
 
 ### Manually edit `devices.json`
 
@@ -147,7 +200,7 @@ The device is saved to `devices.json` and monitoring starts immediately.
 ]
 ```
 
-Restart the script after manual edits.
+Restart the script after manual edits. Devices load as idle until you connect from the UI.
 
 ---
 
