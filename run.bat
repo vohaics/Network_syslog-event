@@ -11,13 +11,13 @@ if %errorlevel%==0 (
     set "PY=python"
 )
 
-%PY% -c "import flask" >nul 2>nul
+%PY% -c "import flask, paramiko" >nul 2>nul
 if errorlevel 1 (
-    echo Installing Flask...
-    %PY% -m pip install flask
+    echo Installing dependencies...
+    %PY% -m pip install -r requirements.txt
     if errorlevel 1 (
         echo.
-        echo Failed to install Flask. Check your Python/pip installation.
+        echo Failed to install dependencies. Check your Python/pip installation.
         pause
         exit /b 1
     )
