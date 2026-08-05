@@ -149,35 +149,51 @@ SSH-Router,10.136.110.254,ssh,22,admin,secret,
 
 Older IOS images that only offer legacy SSH key exchange and ciphers are handled automatically.
 
-## FortiGate (FortiOS) devices
+## Supported platforms
 
-FortiGate is **not** Cisco IOS: it has no `terminal monitor`, and it does not push syslog into a CLI session. Those devices are handled differently:
+| Vendor | How events are collected | Default transport |
+|--------|--------------------------|-------------------|
+| **Cisco IOS / IOS-XE** | `terminal monitor` stream | Telnet or SSH |
+| **FortiGate (FortiOS)** | Poll `execute log display` every 20s | SSH |
+| **Juniper Junos** | `monitor start messages` stream (falls back to `show log messages`) | SSH |
 
-- The vendor is detected from the CLI prompt (e.g. `FortiGate-100F #`), or you can pick **FortiGate** explicitly in the add-device form / a `vendor` column in CSV.
-- Instead of streaming, the FortiOS **event log is polled** every 20 seconds with `execute log display` (read-only, no configuration change).
-- Matched FortiOS events include interface status changes, link monitor changes, and IPsec tunnel-down entries. Adjust `FORTIOS_PATTERNS` in the script to taste.
+Vendor is auto-detected from the CLI prompt (`Router#`, `FortiGate-100F #`, `admin@host>`), or set explicitly in the form / CSV `vendor` column (`cisco`, `fortios`, `junos`).
 
-Memory or disk logging must be enabled on the FortiGate for `execute log display` to return entries — that is the FortiOS default.
+### SSH "no banner received" (common on FortiGate)
 
-For high-volume production use, pointing the FortiGate at a real syslog collector is still the better design; this polling mode exists so you can monitor without changing device configuration.
+Some appliances **wait for the client identification** before sending their own SSH banner. Tera Term always sends first, so it works; a bare `recv()` times out. The monitor now:
+
+1. Sends the client ID before reading the banner
+2. Still tries a full Paramiko handshake even if the raw banner probe is empty
+3. Waits briefly between connection attempts (FortiGate rate-limits rapid reconnects)
+
+Also close extra Tera Term windows when testing — FortiGate SSH session limits are often low (2–3).
+
+### FortiGate notes
+
+No `terminal monitor`. Memory/disk logging must be enabled (default) for `execute log display`. Polling is ~20s granularity, not instant.
+
+### Juniper notes
+
+Stays in operational mode (`user@host>`). Never enters configuration mode. Needs permission for `monitor start messages` or at least `show log messages`.
 
 ### Why a device is not connecting
 
-Press **Test** on any device card. It reports each stage separately, so you can see exactly where it breaks:
+Press **Test** on any device card. It reports each stage separately:
 
 ```
 OK   — TCP connect to 10.136.110.254:22: open
-OK   — SSH banner: SSH-2.0-OpenSSH_7.4
-FAIL — Authentication / shell: AuthenticationException: Authentication failed.
+OK   — SSH banner (raw): SSH-2.0-FortiSSH_7.4
+OK   — SSH handshake (Paramiko): server=SSH-2.0-FortiSSH_7.4
+OK   — Authentication: accepted
+OK   — Shell prompt: FortiGate-100F #
 ```
-
-Each card shows an **Error** line when a connection attempt fails, for example:
 
 | Error shown | Meaning |
 |-------------|---------|
 | `Port 22 is SSH - change this device's protocol to SSH` | Telnet selected for an SSH port |
 | `Authentication failed - check username / password` | Wrong credentials |
-| `No SSH banner - wrong port, firewall, or SSH not enabled` | Nothing speaking SSH on that port |
+| `SSH banner timeout...` | Appliance waited for client ID / rate-limit / session full — click Test again after closing Tera Term |
 | `Timed out - host unreachable or SSH blocked` | Network/ACL problem |
 | `SSH needs Paramiko: pip install paramiko` | Missing dependency |
 
@@ -190,7 +206,7 @@ Each card shows an **Error** line when a connection attempt fails, for example:
 - This monitor opens its **own** session (separate from Tera Term), over Telnet or SSH.
 - You can keep using Tera Term for manual CLI work while the dashboard monitors syslog.
 - Use the **same username/password** from your network list in both tools.
-- Cisco devices usually allow multiple VTY sessions; if you hit “no more connections”, free a VTY line or raise `line vty` limits on the device.
+- Cisco / FortiGate / Juniper all have session limits; if you hit “no more connections”, free a session or raise the limit.
 - Whatever protocol Tera Term uses for a device (Telnet on 23, SSH on 22), select the same one here.
 
 ---

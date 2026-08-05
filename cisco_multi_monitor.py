@@ -82,6 +82,19 @@ FORTIOS_PATTERNS = [
     r"action=(interface-stat-change|link-monitor|tunnel-down)",
     r"tunnel[-_ ]?down",
 ]
+
+# Juniper Junos can stream with "monitor start messages"; we also keep a
+# polling fallback. Patterns cover common interface / routing events.
+JUNOS_POLL_INTERVAL = 20
+JUNOS_PATTERNS = [
+    r"SNMP_TRAP_LINK_DOWN",
+    r"LINK_DOWN",
+    r"chassisd:.*down",
+    r"RPD_BGP_NEIGHBOR_STATE_CHANGED.*Down",
+    r"RPD_OSPF_NBRDOWN",
+    r"Interface\s+\S+\s+.*\bdown\b",
+    r"kernel:\s+\S+:\s+link down",
+]
 # ====================================================
 
 # Shared state
@@ -153,8 +166,12 @@ def normalize_device(raw: dict) -> dict:
     vendor = str(raw.get("vendor") or raw.get("platform") or "").strip().lower()
     if vendor.startswith("forti"):
         vendor = "fortios"
-    elif vendor and vendor != "cisco":
+    elif vendor in ("junos", "juniper", "jnpr"):
+        vendor = "junos"
+    elif vendor in ("cisco", "ios", "ios-xe", "nx-os", "nxos"):
         vendor = "cisco"
+    else:
+        vendor = ""
 
     return {
         "name": name,
@@ -406,6 +423,7 @@ DASHBOARD_HTML = """
                 <option value="">Auto-detect</option>
                 <option value="cisco">Cisco IOS</option>
                 <option value="fortios">FortiGate</option>
+                <option value="junos">Juniper Junos</option>
             </select>
             <input id="f-port" placeholder="Port" value="23">
             <input id="f-user" placeholder="Username" required>
@@ -712,10 +730,11 @@ setInterval(refresh, 3000);
 </html>
 """
 
-SAMPLE_CSV = """name,host,transport,port,username,password,enable_password
-Core-Router,192.168.1.1,telnet,23,admin,cisco123,
-Edge-Switch,192.168.1.2,telnet,23,admin,cisco123,enablepass
-SSH-Router,10.136.110.254,ssh,22,admin,secret,
+SAMPLE_CSV = """name,host,transport,port,vendor,username,password,enable_password
+Core-Router,192.168.1.1,telnet,23,cisco,admin,cisco123,
+SSH-Router,192.168.1.2,ssh,22,cisco,admin,cisco123,enablepass
+FortiGate-FW,10.136.110.254,ssh,22,fortios,admin,secret,
+Juniper-Edge,10.0.0.1,ssh,22,junos,admin,secret,
 """
 
 # -------------------- Routes --------------------
@@ -955,7 +974,11 @@ def describe_error(exc: Exception, transport: str, port: int = 0) -> str:
     if "not a valid rsa" in lowered or "no matching" in lowered:
         return f"SSH algorithm mismatch: {text}"
     if "banner" in lowered:
-        return "No SSH banner - wrong port, firewall, or SSH not enabled"
+        return (
+            "SSH banner timeout - FortiGate/Juniper often need a full Paramiko "
+            "handshake. Click Test (updated), wait 5s between attempts, and "
+            "make sure Tera Term is not using the only free SSH session"
+        )
     if "timed out" in lowered or isinstance(exc, TimeoutError):
         if transport == "telnet":
             return "Timed out - device may be SSH-only (try protocol SSH)"
@@ -994,12 +1017,17 @@ def open_telnet_session(dev: dict):
 
 def open_session(dev: dict):
     """Open a session and return (session, vendor)."""
+    declared = str(dev.get("vendor") or "").strip().lower()
     if resolve_transport(dev) == "ssh":
         session = open_ssh_shell(dev)
         session.write(b"\n")
-        _, _, text = session.expect([b"#", b"$", b">"], timeout=12)
+        _, _, text = session.expect([b"#", b"$", b">"], timeout=15)
         prompt = text.decode(errors="ignore")
-        if prompt.strip().endswith(">") and dev.get("enable_password"):
+        vendor = detect_vendor(dev, prompt)
+
+        # Cisco user-exec '>' needs enable. Junos '>' is operational mode — leave it.
+        # FortiOS uses '#' already.
+        if vendor == "cisco" and prompt.strip().endswith(">") and dev.get("enable_password"):
             session.write(b"enable\n")
             session.read_until(b"assword", timeout=5)
             session.write(dev["enable_password"].encode() + b"\n")
@@ -1007,36 +1035,82 @@ def open_session(dev: dict):
             prompt = text.decode(errors="ignore")
     else:
         session, prompt = open_telnet_session(dev)
+        vendor = detect_vendor(dev, prompt)
 
-    vendor = detect_vendor(dev, prompt)
+    # Prefer declared vendor when set
+    if declared:
+        vendor = detect_vendor(dev, prompt)
+
     prepare_session(session, vendor)
     return session, vendor
 
 def detect_vendor(dev: dict, prompt_text: str) -> str:
-    """'fortios' or 'cisco', from the device setting or the CLI prompt."""
+    """Return 'cisco', 'fortios', or 'junos' from setting or CLI prompt."""
     declared = str(dev.get("vendor") or dev.get("platform") or "").strip().lower()
     if declared.startswith("forti"):
         return "fortios"
-    if declared:
+    if declared in ("junos", "juniper", "jnpr"):
+        return "junos"
+    if declared in ("cisco", "ios", "ios-xe", "nx-os", "nxos"):
         return "cisco"
-    if re.search(r"forti", prompt_text or "", re.IGNORECASE):
+
+    text = prompt_text or ""
+    if re.search(r"forti", text, re.IGNORECASE):
         return "fortios"
+    # Junos operational / config prompts look like user@hostname> or user@hostname#
+    if re.search(r"[\w.-]+@[\w.-]+[>#]\s*$", text, re.MULTILINE) or \
+       re.search(r"\{(master|backup|primary|secondary)(:\d+)?\}", text):
+        return "junos"
     return "cisco"
 
 def prepare_session(session, vendor: str):
     """Send the vendor's setup commands. No device configuration is changed."""
     if vendor == "fortios":
-        # Prime the log filters used by each poll.
         for cmd in (b"execute log filter category event\n",
                     b"execute log filter view-lines 30\n"):
             session.write(cmd)
             time.sleep(0.4)
+    elif vendor == "junos":
+        # Operational mode only — never enter configuration mode.
+        session.write(b"set cli screen-length 0\n")
+        time.sleep(0.3)
+        session.write(b"set cli screen-width 0\n")
+        time.sleep(0.3)
+        # Stream syslog-like messages into this session (like Cisco terminal monitor).
+        session.write(b"monitor start messages\n")
+        time.sleep(0.4)
     else:
         session.write(b"terminal length 0\n")
         session.write(b"terminal monitor\n")
         session.write(b"\n")
     time.sleep(0.4)
     session.read_very_eager()
+
+def vendor_mode_label(vendor: str) -> str:
+    return {
+        "fortios": "log polling",
+        "junos": "monitor start messages",
+        "cisco": "terminal monitor",
+    }.get(vendor, "monitor")
+
+def vendor_patterns(vendor: str) -> list:
+    if vendor == "fortios":
+        return FORTIOS_PATTERNS
+    if vendor == "junos":
+        return JUNOS_PATTERNS
+    return PATTERNS
+
+def vendor_poll_command(vendor: str) -> bytes:
+    if vendor == "fortios":
+        return b"execute log display\n"
+    if vendor == "junos":
+        return b"show log messages | last 30\n"
+    return b""
+
+def vendor_uses_polling(vendor: str) -> bool:
+    # FortiOS must poll. Junos prefers streaming but falls back to polling
+    # if "monitor start" is unavailable on the image.
+    return vendor == "fortios"
 
 def match_lines(name: str, text: str, patterns: list, seen: deque):
     """Record new matching lines, skipping ones already reported for this device."""
@@ -1059,7 +1133,8 @@ def collect_output(session, seconds: float = 3.0) -> str:
         data = session.read_very_eager().decode(errors="ignore")
         if data:
             chunks.append(data)
-            if "--More--" in data or "(q)uit" in data:
+            if "--More--" in data or "(q)uit" in data or "---(more)---" in data.lower() \
+               or "more)" in data.lower():
                 session.write(b" ")
         time.sleep(0.25)
     return "".join(chunks)
@@ -1074,6 +1149,7 @@ def monitor_device(dev: dict, stop_event: threading.Event):
     vendor = detect_vendor(dev, "")
     seen_lines = deque(maxlen=400)
     last_poll = 0
+    junos_stream_ok = True
 
     with status_lock:
         device_status[name] = {
@@ -1096,32 +1172,45 @@ def monitor_device(dev: dict, stop_event: threading.Event):
                     device_status[name]["connected"] = True
                     device_status[name]["last_error"] = ""
                     device_status[name]["vendor"] = vendor
-                mode = "log polling" if vendor == "fortios" else "terminal monitor"
+                mode = vendor_mode_label(vendor)
                 print(f"[{name}] Connected ({transport.upper()}, {vendor}, {mode})")
                 last_poll = 0
+                junos_stream_ok = vendor == "junos"
 
-            if vendor == "fortios":
-                if time.time() - last_poll > FORTIOS_POLL_INTERVAL:
-                    tn.write(b"execute log display\n")
-                    data = collect_output(tn, seconds=3.0)
+            if vendor_uses_polling(vendor) or (vendor == "junos" and not junos_stream_ok):
+                interval = FORTIOS_POLL_INTERVAL if vendor == "fortios" else JUNOS_POLL_INTERVAL
+                if time.time() - last_poll > interval:
+                    tn.write(vendor_poll_command(vendor))
+                    data = collect_output(tn, seconds=3.5)
                     last_poll = time.time()
                     with status_lock:
                         device_status[name]["last_keepalive"] = datetime.now().strftime("%H:%M:%S")
-                    match_lines(name, data, FORTIOS_PATTERNS, seen_lines)
+                    match_lines(name, data, vendor_patterns(vendor), seen_lines)
                 else:
                     time.sleep(0.5)
                 continue
 
             data = tn.read_very_eager().decode(errors="ignore")
             if data:
+                # Junos "monitor start" may be denied — fall back to polling.
+                if vendor == "junos" and re.search(
+                    r"(error:|permission denied|unknown command|syntax error)",
+                    data, re.IGNORECASE
+                ):
+                    print(f"[{name}] Junos stream unavailable, falling back to log polling")
+                    junos_stream_ok = False
+                    last_poll = 0
+                    continue
                 for line in data.splitlines():
                     line = line.strip()
                     if not line:
                         continue
                     print(f"[{name}] {line}")
-                    for pat in PATTERNS:
+                    for pat in vendor_patterns(vendor):
                         if re.search(pat, line, re.IGNORECASE):
-                            add_event(name, line)
+                            if line not in seen_lines:
+                                seen_lines.append(line)
+                                add_event(name, line)
                             break
 
             if time.time() - last_keepalive > KEEPALIVE_INTERVAL:

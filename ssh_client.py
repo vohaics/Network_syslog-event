@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-SSH session support for devices that do not allow Telnet (port 22).
+SSH session support for network devices (Cisco IOS, FortiOS, Junos).
 
 Wraps a Paramiko interactive shell in the same small interface the monitor
-loop uses for Telnet (`read_very_eager`, `write`, `close`), so the syslog
-matching logic stays identical for both transports.
+loop uses for Telnet (`read_very_eager`, `write`, `close`).
 
 Requires: pip install paramiko
 """
@@ -15,12 +14,12 @@ import time
 
 try:
     import paramiko
-except ImportError:                        # reported clearly when a device needs SSH
+except ImportError:
     paramiko = None
 
-# Older Cisco IOS often only offers legacy key exchange / ciphers that modern
-# Paramiko disables by default. These are appended to Paramiko's preferences so
-# such devices still negotiate instead of failing with "no matching ..." errors.
+# Older network gear often only offers legacy key exchange / ciphers that modern
+# Paramiko disables by default. Only names this Paramiko build actually
+# implements are added — advertising unimplemented ones breaks the handshake.
 LEGACY_KEX = [
     "diffie-hellman-group14-sha1",
     "diffie-hellman-group-exchange-sha1",
@@ -29,13 +28,16 @@ LEGACY_KEX = [
 LEGACY_CIPHERS = ["aes128-cbc", "aes192-cbc", "aes256-cbc", "3des-cbc"]
 LEGACY_KEYS = ["ssh-rsa"]
 
+CLIENT_ID = b"SSH-2.0-NetworkMonitor_1.0\r\n"
+
 
 class SSHSession:
     """Interactive SSH shell with a Telnet-like read/write interface."""
 
-    def __init__(self, channel, client):
+    def __init__(self, channel, client, remote_version=""):
         self.channel = channel
         self.client = client
+        self.remote_version = remote_version or ""
         self._buf = bytearray()
 
     def _drain(self):
@@ -94,12 +96,7 @@ class SSHSession:
 
 
 def _tune_legacy_algorithms():
-    """Enable legacy KEX/ciphers used by older network gear.
-
-    Only algorithms this Paramiko build actually implements are added.
-    Advertising unimplemented names breaks the handshake, which surfaces as
-    confusing "no banner" / reset errors.
-    """
+    """Enable legacy KEX/ciphers used by older network gear."""
     transport = paramiko.Transport
     supported = (
         ("_preferred_kex", LEGACY_KEX, getattr(transport, "_kex_info", {})),
@@ -114,50 +111,7 @@ def _tune_legacy_algorithms():
         setattr(transport, attr, tuple(current))
 
 
-def open_ssh_session(dev: dict, timeout: float = 15) -> SSHSession:
-    """Log in over SSH, enter enable mode if needed, and turn on terminal monitor."""
-    if paramiko is None:
-        raise RuntimeError(
-            "SSH requires Paramiko. Install it with: pip install paramiko"
-        )
-
-    _tune_legacy_algorithms()
-
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=dev["host"],
-        port=int(dev.get("port", 22)),
-        username=dev["username"],
-        password=dev["password"],
-        timeout=timeout,
-        banner_timeout=timeout,
-        auth_timeout=timeout,
-        look_for_keys=False,
-        allow_agent=False,
-    )
-
-    channel = client.invoke_shell(width=200, height=1000)
-    channel.settimeout(0.0)
-    session = SSHSession(channel, client)
-
-    # Some devices show a banner or "Password:" prompt inside the shell.
-    index, _, _ = session.expect([b"#", b">"], timeout=10)
-    if index == 1 and dev.get("enable_password"):
-        session.write(b"enable\n")
-        session.read_until(b"assword", timeout=5)
-        session.write(dev["enable_password"].encode() + b"\n")
-        session.expect([b"#"], timeout=8)
-
-    session.write(b"terminal length 0\n")
-    session.write(b"terminal monitor\n")
-    session.write(b"\n")
-    time.sleep(0.4)
-    session.read_very_eager()
-    return session
-
-
-def open_ssh_shell(dev: dict, timeout: float = 15) -> SSHSession:
+def open_ssh_shell(dev: dict, timeout: float = 25) -> SSHSession:
     """Log in over SSH and return the shell without sending any vendor commands."""
     if paramiko is None:
         raise RuntimeError("SSH requires Paramiko. Install it with: pip install paramiko")
@@ -176,19 +130,44 @@ def open_ssh_shell(dev: dict, timeout: float = 15) -> SSHSession:
         auth_timeout=timeout,
         look_for_keys=False,
         allow_agent=False,
+        compress=False,
     )
-    channel = client.invoke_shell(width=200, height=1000)
+    channel = client.invoke_shell(term="vt100", width=200, height=1000)
     channel.settimeout(0.0)
-    return SSHSession(channel, client)
+
+    remote = ""
+    try:
+        remote = client.get_transport().remote_version or ""
+    except Exception:
+        pass
+    return SSHSession(channel, client, remote_version=remote)
 
 
-def read_ssh_banner(host: str, port: int = 22, timeout: float = 8) -> str:
-    """Read the raw SSH identification string, e.g. 'SSH-2.0-OpenSSH_8.9'."""
+# Kept for callers that still import the old name.
+def open_ssh_session(dev: dict, timeout: float = 25) -> SSHSession:
+    return open_ssh_shell(dev, timeout=timeout)
+
+
+def read_ssh_banner(host: str, port: int = 22, timeout: float = 10) -> str:
+    """Read the SSH identification string.
+
+    Many appliances (FortiGate, some Juniper) wait for the *client* ID before
+    sending their own banner. Tera Term always sends first; a bare recv()
+    times out and falsely reports "no banner".
+    """
     with socket.create_connection((host, int(port)), timeout) as sock:
         sock.settimeout(timeout)
+        try:
+            sock.sendall(CLIENT_ID)
+        except OSError:
+            pass
         data = b""
-        while b"\n" not in data and len(data) < 512:
-            chunk = sock.recv(128)
+        deadline = time.monotonic() + timeout
+        while b"\n" not in data and len(data) < 512 and time.monotonic() < deadline:
+            try:
+                chunk = sock.recv(256)
+            except socket.timeout:
+                break
             if not chunk:
                 break
             data += chunk
@@ -196,7 +175,12 @@ def read_ssh_banner(host: str, port: int = 22, timeout: float = 8) -> str:
 
 
 def diagnose_ssh(dev: dict) -> list:
-    """Step-by-step SSH check used by the dashboard's Test button."""
+    """Step-by-step SSH check used by the dashboard's Test button.
+
+    Does NOT abort after a raw-banner failure — Paramiko is still tried,
+    because that is what the monitor itself uses and some devices only answer
+    after a full client handshake.
+    """
     steps = []
     host, port = dev["host"], int(dev.get("port", 22))
 
@@ -208,40 +192,54 @@ def diagnose_ssh(dev: dict) -> list:
         steps.append({"step": f"TCP connect to {host}:{port}", "ok": False, "detail": str(e)})
         return steps
 
+    # Brief pause so appliances with connection rate limits recover
+    # (FortiGate often needs this after a rapid open/close).
+    time.sleep(0.6)
+
     try:
-        banner = read_ssh_banner(host, port)
+        banner = read_ssh_banner(host, port, timeout=10)
         looks_like_ssh = banner.startswith("SSH-")
         steps.append({
-            "step": "SSH banner",
+            "step": "SSH banner (raw)",
             "ok": looks_like_ssh,
-            "detail": banner or "(no banner received)",
+            "detail": banner or "(no banner — will still try full Paramiko handshake)",
         })
-        if not looks_like_ssh:
-            return steps
     except Exception as e:
-        steps.append({"step": "SSH banner", "ok": False, "detail": str(e)})
-        return steps
+        steps.append({
+            "step": "SSH banner (raw)",
+            "ok": False,
+            "detail": f"{e} — will still try full Paramiko handshake",
+        })
 
     if paramiko is None:
         steps.append({"step": "Paramiko installed", "ok": False,
                       "detail": "pip install paramiko"})
         return steps
 
+    time.sleep(0.6)
     session = None
     try:
-        session = open_ssh_shell(dev)
+        session = open_ssh_shell(dev, timeout=25)
+        remote = session.remote_version or "(unknown)"
+        steps.append({"step": "SSH handshake (Paramiko)", "ok": True,
+                      "detail": f"server={remote}"})
         steps.append({"step": "Authentication", "ok": True, "detail": "accepted"})
         session.write(b"\n")
-        time.sleep(1.2)
+        time.sleep(1.5)
         prompt = session.read_very_eager().decode(errors="ignore").strip()
+        # Clear ANSI / control chars for display
+        prompt_clean = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", prompt)
         steps.append({
             "step": "Shell prompt",
-            "ok": bool(prompt),
-            "detail": prompt[-200:] or "(no output)",
+            "ok": bool(prompt_clean),
+            "detail": prompt_clean[-240:] or "(no output — check vendor / privilege)",
         })
     except Exception as e:
-        steps.append({"step": "Authentication / shell", "ok": False,
-                      "detail": f"{e.__class__.__name__}: {e}"})
+        steps.append({
+            "step": "SSH handshake / auth / shell",
+            "ok": False,
+            "detail": f"{e.__class__.__name__}: {e}",
+        })
     finally:
         if session:
             session.close()
