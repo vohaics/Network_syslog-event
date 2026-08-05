@@ -20,7 +20,10 @@ Features:
 Author: Generated for network operations use
 """
 
-import telnetlib
+try:
+    from telnetlib import Telnet          # Python <= 3.12
+except ModuleNotFoundError:               # telnetlib removed in Python 3.13
+    from telnet_client import Telnet
 import time
 import re
 import smtplib
@@ -818,7 +821,7 @@ def monitor_device(dev: dict, stop_event: threading.Event):
         try:
             if tn is None:
                 print(f"[{name}] Connecting to {dev['host']}...")
-                tn = telnetlib.Telnet(dev["host"], dev["port"], timeout=12)
+                tn = Telnet(dev["host"], dev["port"], timeout=12)
 
                 tn.read_until(b"Username:", timeout=8)
                 tn.write(dev["username"].encode() + b"\n")
