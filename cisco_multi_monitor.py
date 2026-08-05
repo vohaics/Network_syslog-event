@@ -24,6 +24,7 @@ try:
     from telnetlib import Telnet          # Python <= 3.12
 except ModuleNotFoundError:               # telnetlib removed in Python 3.13
     from telnet_client import Telnet
+from ssh_client import open_ssh_session
 import time
 import re
 import smtplib
@@ -114,11 +115,18 @@ def normalize_device(raw: dict) -> dict:
     if not name:
         raise ValueError("name required")
 
-    port = raw.get("port", 23)
+    transport = str(raw.get("transport") or raw.get("protocol") or "").strip().lower()
+    if transport not in ("ssh", "telnet"):
+        transport = ""
+
+    raw_port = raw.get("port", "")
     try:
-        port = int(port) if str(port).strip() else 23
+        port = int(raw_port) if str(raw_port).strip() else (22 if transport == "ssh" else 23)
     except (TypeError, ValueError):
-        port = 23
+        port = 22 if transport == "ssh" else 23
+
+    if not transport:
+        transport = "ssh" if port == 22 else "telnet"
 
     username = str(raw.get("username") or raw.get("user") or "").strip()
     password = str(raw.get("password") or raw.get("pass") or "")
@@ -133,10 +141,18 @@ def normalize_device(raw: dict) -> dict:
         "name": name,
         "host": host,
         "port": port,
+        "transport": transport,
         "username": username,
         "password": password,
         "enable_password": enable_password,
     }
+
+def resolve_transport(dev: dict) -> str:
+    """Return 'ssh' or 'telnet'. Port 22 implies SSH unless stated otherwise."""
+    transport = str(dev.get("transport") or dev.get("protocol") or "").strip().lower()
+    if transport in ("ssh", "telnet"):
+        return transport
+    return "ssh" if int(dev.get("port", 23)) == 22 else "telnet"
 
 def parse_devices_csv(text: str):
     """Parse CSV inventory. Flexible header names."""
@@ -202,11 +218,13 @@ def inventory_public():
             "name": d["name"],
             "host": d["host"],
             "port": d.get("port", 23),
+            "transport": resolve_transport(d),
             "username": d.get("username", ""),
             "monitoring": monitoring,
             "connected": bool(st.get("connected")),
             "last_keepalive": st.get("last_keepalive", "-"),
             "last_event": st.get("last_event", "-"),
+            "last_error": st.get("last_error", ""),
         })
     return out
 
@@ -312,6 +330,7 @@ DASHBOARD_HTML = """
     .msg { font-size: 0.85rem; color: var(--muted); margin-top: 8px; }
     .msg.ok { color: var(--green); }
     .msg.err { color: var(--red); }
+    .err-line { line-height: 1.35; word-break: break-word; }
     .count-badge { color: var(--muted); font-size: 0.85rem; }
     @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } .form-row { grid-template-columns: 1fr; } }
 </style>
@@ -354,6 +373,10 @@ DASHBOARD_HTML = """
         <div class="form-row">
             <input id="f-name" placeholder="Name (e.g. Core-Router)" required>
             <input id="f-host" placeholder="IP / Hostname" required>
+            <select id="f-transport" class="filter-select" onchange="syncPort()">
+                <option value="telnet">Telnet</option>
+                <option value="ssh">SSH</option>
+            </select>
             <input id="f-port" placeholder="Port" value="23">
             <input id="f-user" placeholder="Username" required>
             <input id="f-pass" type="password" placeholder="Password" required>
@@ -453,14 +476,19 @@ function renderInventory(list) {
         const monBtn = d.monitoring
             ? `<button class="btn btn-sm warn" onclick="stopMonitor('${escapeAttr(d.name)}')">Stop</button>`
             : `<button class="btn btn-sm success" onclick="startMonitor('${escapeAttr(d.name)}')">Connect & Monitor</button>`;
+        const errorLine = d.last_error
+            ? `<div class="meta err-line">Error: <span style="color:var(--red)">${escapeHtml(d.last_error)}</span></div>`
+            : '';
         div.innerHTML = `
             <button class="btn-remove" onclick="removeDevice('${escapeAttr(d.name)}')">Remove</button>
             <h3><span class="status-dot ${st.dot}"></span>${escapeHtml(d.name)}</h3>
             <div class="meta">Host: <span>${escapeHtml(d.host)}:${d.port}</span></div>
+            <div class="meta">Protocol: <span>${(d.transport || 'telnet').toUpperCase()}</span></div>
             <div class="meta">User: <span>${escapeHtml(d.username)}</span></div>
             <div class="meta">Status: <span style="color:${st.color}">${st.text}</span></div>
             <div class="meta">Last keepalive: <span>${escapeHtml(d.last_keepalive)}</span></div>
             <div class="meta">Last event: <span>${escapeHtml(d.last_event)}</span></div>
+            ${errorLine}
             <div class="card-actions">${monBtn}</div>
         `;
         devicesEl.appendChild(div);
@@ -561,11 +589,18 @@ async function importFile() {
     }
 }
 
+function syncPort() {
+    const transport = document.getElementById('f-transport').value;
+    document.getElementById('f-port').value = transport === 'ssh' ? '22' : '23';
+}
+
 async function addDevice() {
+    const transport = document.getElementById('f-transport').value;
     const payload = {
         name: document.getElementById('f-name').value.trim(),
         host: document.getElementById('f-host').value.trim(),
-        port: parseInt(document.getElementById('f-port').value) || 23,
+        transport: transport,
+        port: parseInt(document.getElementById('f-port').value) || (transport === 'ssh' ? 22 : 23),
         username: document.getElementById('f-user').value.trim(),
         password: document.getElementById('f-pass').value,
         enable_password: document.getElementById('f-enable').value
@@ -582,7 +617,7 @@ async function addDevice() {
     const res = await r.json();
     if (res.ok) {
         ['f-name','f-host','f-user','f-pass','f-enable'].forEach(id => document.getElementById(id).value = '');
-        document.getElementById('f-port').value = '23';
+        syncPort();
         refresh();
     } else {
         alert(res.error || "Failed to add device");
@@ -618,10 +653,10 @@ setInterval(refresh, 3000);
 </html>
 """
 
-SAMPLE_CSV = """name,host,port,username,password,enable_password
-Core-Router,192.168.1.1,23,admin,cisco123,
-Edge-Switch,192.168.1.2,23,admin,cisco123,enablepass
-Branch-RTR,10.0.0.1,23,netops,secret,
+SAMPLE_CSV = """name,host,transport,port,username,password,enable_password
+Core-Router,192.168.1.1,telnet,23,admin,cisco123,
+Edge-Switch,192.168.1.2,telnet,23,admin,cisco123,enablepass
+SSH-Router,10.136.110.254,ssh,22,admin,secret,
 """
 
 # -------------------- Routes --------------------
@@ -803,9 +838,70 @@ def add_event(device_name: str, msg: str):
             device_status[device_name]["last_event"] = now
     send_email(f"[Cisco Alert] {device_name}", f"Device : {device_name}\nTime   : {now}\n\n{msg}")
 
+# -------------------- Connect --------------------
+def describe_error(exc: Exception, transport: str, port: int = 0) -> str:
+    """Turn a connection exception into a short hint shown on the device card."""
+    text = str(exc) or exc.__class__.__name__
+    lowered = text.lower()
+
+    if transport == "telnet" and int(port or 0) == 22:
+        return "Port 22 is SSH - change this device's protocol to SSH"
+    if "authentication" in lowered or "auth failed" in lowered:
+        return "Authentication failed - check username / password"
+    if "not a valid rsa" in lowered or "no matching" in lowered:
+        return f"SSH algorithm mismatch: {text}"
+    if "banner" in lowered:
+        return "No SSH banner - wrong port, firewall, or SSH not enabled"
+    if "timed out" in lowered or isinstance(exc, TimeoutError):
+        if transport == "telnet":
+            return "Timed out - device may be SSH-only (try protocol SSH)"
+        return "Timed out - host unreachable or SSH blocked"
+    if "refused" in lowered:
+        return f"Connection refused on this port - is {transport.upper()} enabled?"
+    if "unreachable" in lowered or "no route" in lowered:
+        return "Network unreachable from this PC"
+    if "paramiko" in lowered:
+        return "SSH needs Paramiko: pip install paramiko"
+    return text[:160]
+
+def open_telnet_session(dev: dict):
+    tn = Telnet(dev["host"], dev["port"], timeout=12)
+
+    tn.read_until(b"Username:", timeout=8)
+    tn.write(dev["username"].encode() + b"\n")
+    tn.read_until(b"Password:", timeout=8)
+    tn.write(dev["password"].encode() + b"\n")
+
+    idx, _, _ = tn.expect([b">", b"#"], timeout=8)
+    if idx == -1:
+        raise RuntimeError(
+            "No Cisco prompt received. If this device uses SSH (port 22), "
+            "set its protocol to SSH."
+        )
+    if idx == 0:
+        tn.write(b"enable\n")
+        if dev.get("enable_password"):
+            tn.read_until(b"Password:", timeout=5)
+            tn.write(dev["enable_password"].encode() + b"\n")
+        tn.expect([b"#"], timeout=8)
+
+    tn.write(b"terminal length 0\n")
+    tn.write(b"terminal monitor\n")
+    tn.write(b"\n")
+    time.sleep(0.3)
+    tn.read_very_eager()
+    return tn
+
+def open_session(dev: dict):
+    """Open a Telnet or SSH monitoring session depending on the device."""
+    if resolve_transport(dev) == "ssh":
+        return open_ssh_session(dev)
+    return open_telnet_session(dev)
+
 # -------------------- Monitor --------------------
 def monitor_device(dev: dict, stop_event: threading.Event):
     name = dev["name"]
+    transport = resolve_transport(dev)
     tn = None
     last_keepalive = 0
 
@@ -814,37 +910,21 @@ def monitor_device(dev: dict, stop_event: threading.Event):
             "connected": False,
             "last_keepalive": "-",
             "last_event": device_status.get(name, {}).get("last_event", "-"),
-            "host": dev["host"]
+            "host": dev["host"],
+            "transport": transport,
+            "last_error": ""
         }
 
     while not stop_event.is_set():
         try:
             if tn is None:
-                print(f"[{name}] Connecting to {dev['host']}...")
-                tn = Telnet(dev["host"], dev["port"], timeout=12)
-
-                tn.read_until(b"Username:", timeout=8)
-                tn.write(dev["username"].encode() + b"\n")
-                tn.read_until(b"Password:", timeout=8)
-                tn.write(dev["password"].encode() + b"\n")
-
-                idx, _, _ = tn.expect([b">", b"#"], timeout=8)
-                if idx == 0:
-                    tn.write(b"enable\n")
-                    if dev.get("enable_password"):
-                        tn.read_until(b"Password:", timeout=5)
-                        tn.write(dev["enable_password"].encode() + b"\n")
-                    tn.expect([b"#"], timeout=8)
-
-                tn.write(b"terminal length 0\n")
-                tn.write(b"terminal monitor\n")
-                tn.write(b"\n")
-                time.sleep(0.3)
-                tn.read_very_eager()
+                print(f"[{name}] Connecting to {dev['host']}:{dev['port']} over {transport.upper()}...")
+                tn = open_session(dev)
 
                 with status_lock:
                     device_status[name]["connected"] = True
-                print(f"[{name}] Connected + terminal monitor ON")
+                    device_status[name]["last_error"] = ""
+                print(f"[{name}] Connected + terminal monitor ON ({transport.upper()})")
 
             data = tn.read_very_eager().decode(errors="ignore")
             if data:
@@ -867,10 +947,12 @@ def monitor_device(dev: dict, stop_event: threading.Event):
             time.sleep(0.35)
 
         except Exception as e:
+            reason = describe_error(e, transport, dev.get("port", 0))
             print(f"[{name}] Lost: {e}")
             with status_lock:
                 if name in device_status:
                     device_status[name]["connected"] = False
+                    device_status[name]["last_error"] = reason
             try:
                 if tn:
                     tn.close()

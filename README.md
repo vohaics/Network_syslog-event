@@ -29,9 +29,10 @@ It keeps persistent Telnet sessions, enables `terminal monitor`, watches for cri
 
 - Python 3.8 or higher (**including 3.13+**)
 - Flask
+- Paramiko (only if you monitor devices over **SSH**)
 
 ```bash
-pip install flask
+pip install -r requirements.txt
 ```
 
 (`smtplib`, `json`, `csv` are part of the Python standard library.)
@@ -127,15 +128,50 @@ A sample file is also available from the dashboard: **Sample CSV**.
 
 ---
 
+## Telnet or SSH
+
+Both are supported. Pick the protocol in the add-device form, or let the port decide:
+
+| Port | Protocol used |
+|------|---------------|
+| 23 | Telnet |
+| 22 | SSH (needs `pip install paramiko`) |
+
+If Tera Term reaches a device on **port 22**, that device is SSH-only — set its protocol to **SSH** here too. Choosing Telnet against port 22 leaves the card in *Reconnecting…*, and the card now says exactly that.
+
+CSV import accepts a `transport` (or `protocol`) column:
+
+```csv
+name,host,transport,port,username,password,enable_password
+Core-Router,192.168.1.1,telnet,23,admin,cisco123,
+SSH-Router,10.136.110.254,ssh,22,admin,secret,
+```
+
+Older IOS images that only offer legacy SSH key exchange and ciphers are handled automatically.
+
+### Why a device is not connecting
+
+Each card shows an **Error** line when a connection attempt fails, for example:
+
+| Error shown | Meaning |
+|-------------|---------|
+| `Port 22 is SSH - change this device's protocol to SSH` | Telnet selected for an SSH port |
+| `Authentication failed - check username / password` | Wrong credentials |
+| `No SSH banner - wrong port, firewall, or SSH not enabled` | Nothing speaking SSH on that port |
+| `Timed out - host unreachable or SSH blocked` | Network/ACL problem |
+| `SSH needs Paramiko: pip install paramiko` | Missing dependency |
+
+---
+
 ## Tera Term and this tool
 
 **Yes — using Tera Term is OK.**
 
-- This monitor opens its **own** Telnet session (separate from Tera Term).
+- This monitor opens its **own** session (separate from Tera Term), over Telnet or SSH.
 - You can keep using Tera Term for manual CLI work while the dashboard monitors syslog.
 - Use the **same username/password** from your network list in both tools.
-- Cisco devices usually allow multiple VTY (Telnet) sessions; if you hit “no more connections”, free a VTY line or raise `line vty` limits on the device.
-- This tool uses **Telnet only** (not SSH). If the device only allows SSH, use Tera Term over SSH for manual access, and adapt this script (e.g. `paramiko` / `netmiko`) for monitoring.
+- Cisco devices usually allow multiple VTY sessions; if you hit “no more connections”, free a VTY line or raise `line vty` limits on the device.
+- Whatever protocol Tera Term uses for a device (Telnet on 23, SSH on 22), select the same one here.
 
 ---
 
@@ -279,7 +315,9 @@ sudo systemctl enable --now cisco-monitor
 | Problem | Possible cause / solution |
 |---------|---------------------------|
 | `ModuleNotFoundError: No module named 'telnetlib'` | Python 3.13+ removed `telnetlib`. Make sure `telnet_client.py` sits in the same folder as `cisco_multi_monitor.py` (it is used automatically) |
-| Cannot connect | Check IP, port, username, password, and that Telnet is allowed |
+| Stuck on *Reconnecting…* but Tera Term logs in fine | Tera Term is probably using **SSH (port 22)**. Set the device protocol to **SSH**. Read the card's Error line |
+| `SSH requires Paramiko` | Run `pip install paramiko` |
+| Cannot connect | Check IP, port, username, password, and that Telnet/SSH is allowed |
 | Session drops often | Lower `KEEPALIVE_INTERVAL` or check device `exec-timeout` |
 | No email received | Check SMTP settings and Gmail App Password |
 | No events appear | Confirm the device is generating the expected syslog messages (`terminal monitor` works when you login manually) |
