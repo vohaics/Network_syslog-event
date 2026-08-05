@@ -19,10 +19,13 @@ on their own PC instead.
 """
 
 import os
+import re
+import sys
 import shutil
 import subprocess
 import tempfile
 import glob
+import platform
 
 try:
     import winreg  # Windows only
@@ -42,6 +45,82 @@ GLOB_PATTERNS = [
     r"C:\tools\teraterm*\ttermpro.exe",
     r"C:\Users\*\AppData\Local\Programs\teraterm*\ttermpro.exe",
 ]
+
+WINDOWS_PATH_RE = re.compile(r"^([A-Za-z]):[\\/](.*)$")
+
+
+def is_windows() -> bool:
+    return os.name == "nt"
+
+
+def is_wsl() -> bool:
+    if is_windows():
+        return False
+    try:
+        with open("/proc/version", "r", encoding="utf-8", errors="ignore") as fh:
+            return "microsoft" in fh.read().lower()
+    except OSError:
+        return False
+
+
+def host_platform() -> dict:
+    """Describe the machine actually running this dashboard."""
+    return {
+        "system": platform.system(),
+        "windows": is_windows(),
+        "wsl": is_wsl(),
+        "python": sys.version.split()[0],
+    }
+
+
+def path_candidates(path: str) -> list:
+    """Variants of a path to try, so Windows paths still work under WSL."""
+    path = (path or "").strip().strip('"')
+    if not path:
+        return []
+    candidates = [path]
+    if not is_windows():
+        match = WINDOWS_PATH_RE.match(path)
+        if match:
+            drive, rest = match.group(1).lower(), match.group(2).replace("\\", "/")
+            candidates.append(f"/mnt/{drive}/{rest}")
+            candidates.append(f"/{drive}/{rest}")
+    return candidates
+
+
+def resolve_exe(path: str) -> dict:
+    """Check one user-supplied path and explain the outcome."""
+    raw = (path or "").strip().strip('"')
+    if not raw:
+        return {"exe": "", "reason": "empty path"}
+
+    tried = []
+    for candidate in path_candidates(raw):
+        tried.append(candidate)
+        if os.path.isfile(candidate):
+            return {"exe": candidate, "reason": "found", "tried": tried}
+        if os.path.isdir(candidate):
+            inner = os.path.join(candidate, "ttermpro.exe")
+            tried.append(inner)
+            if os.path.isfile(inner):
+                return {"exe": inner, "reason": "found in folder", "tried": tried}
+            return {
+                "exe": "",
+                "reason": "that folder exists but has no ttermpro.exe inside",
+                "tried": tried,
+            }
+
+    parent = os.path.dirname(tried[0]) if tried else ""
+    if parent and os.path.isdir(parent):
+        reason = "folder exists but the file does not - check the exact file name"
+    elif not is_windows() and WINDOWS_PATH_RE.match(raw):
+        reason = (
+            f"this dashboard is running on {platform.system()}, so the Windows path "
+            f"{raw} does not exist here"
+        )
+    else:
+        reason = "file does not exist on the machine running this dashboard"
+    return {"exe": "", "reason": reason, "tried": tried}
 
 
 def _registry_path() -> str:
@@ -68,14 +147,16 @@ def detect(explicit: str = "", search_paths=()) -> dict:
     searched = []
 
     if explicit:
-        searched.append(f"TERATERM_EXE={explicit}")
-        if os.path.isfile(explicit):
-            return _result(explicit, searched)
+        result = resolve_exe(explicit)
+        searched.append(f"configured: {explicit} -> {result['reason']}")
+        if result["exe"]:
+            return _result(result["exe"], searched)
 
     for path in search_paths:
-        searched.append(path)
-        if os.path.isfile(path):
-            return _result(path, searched)
+        for candidate in path_candidates(path):
+            searched.append(candidate)
+            if os.path.isfile(candidate):
+                return _result(candidate, searched)
 
     reg = _registry_path()
     searched.append("Windows registry (App Paths\\ttermpro.exe)")
@@ -83,10 +164,11 @@ def detect(explicit: str = "", search_paths=()) -> dict:
         return _result(reg, searched)
 
     for pattern in GLOB_PATTERNS:
-        searched.append(pattern)
-        matches = sorted(glob.glob(pattern))
-        if matches:
-            return _result(matches[0], searched)
+        for candidate in path_candidates(pattern):
+            searched.append(candidate)
+            matches = sorted(glob.glob(candidate))
+            if matches:
+                return _result(matches[0], searched)
 
     for name in EXE_NAMES:
         found = shutil.which(name)

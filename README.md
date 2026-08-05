@@ -251,11 +251,34 @@ to auto-detect.
 
 Priority: UI Settings → `TERATERM_EXE` environment variable → auto-detect.
 
-### "Tera Term not found"
+### "Tera Term not found" even though the path is correct
 
-The header badge turns red when `ttermpro.exe` cannot be found. Open Settings,
-paste the path for this PC, and Save. The badge lists how many locations were
-searched when Detect fails.
+Click **Detect** with your path in the box — it now checks that exact path and
+says why it failed:
+
+| Message | Meaning |
+|---------|---------|
+| `folder exists but the file does not` | Wrong file name in that folder |
+| `that folder exists but has no ttermpro.exe inside` | You pointed at the wrong folder |
+| `this dashboard is running on Linux/…, so the Windows path … does not exist here` | **The dashboard is not running on your Windows PC** |
+
+That last one is the common surprise. Tera Term is launched by the machine
+**hosting the dashboard**, not by your browser. If you start
+`cisco_multi_monitor.py` inside WSL, a container, or on a server, it cannot see
+`C:\...` or start Windows programs — even though the browser shows
+`127.0.0.1:5000`.
+
+Fixes:
+
+* run `python cisco_multi_monitor.py` in a normal **Windows** Command Prompt / PowerShell, **or**
+* keep it where it is and use the **.ttl macro download** to open Tera Term yourself
+
+Windows paths are translated automatically when running under WSL
+(`C:\dir\file` → `/mnt/c/dir/file`), so a WSL-hosted dashboard can still find
+the file — but it still cannot launch a Windows GUI program reliably.
+
+You can also paste the **folder** instead of the full file path; `ttermpro.exe`
+is appended for you.
 
 ### If the dashboard runs on a different machine
 

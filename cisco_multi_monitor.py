@@ -872,7 +872,12 @@ async function saveSettings() {
         } else {
             msg.className = 'msg err';
             msg.textContent = res.error || 'Save failed';
-            if (res.hint) msg.textContent += ' — ' + res.hint;
+            if (res.host && !res.host.windows) {
+                msg.textContent += ' — the dashboard is running on '
+                    + (res.host.system || 'non-Windows')
+                    + (res.host.wsl ? ' (WSL)' : '')
+                    + ', so it cannot see Windows paths or start Tera Term.';
+            }
         }
     } catch (e) {
         msg.className = 'msg err';
@@ -883,25 +888,52 @@ async function saveSettings() {
 async function detectTeraTerm() {
     const msg = document.getElementById('settings-msg');
     const input = document.getElementById('set-tt-exe');
+    const typed = (input && input.value || '').trim();
     msg.className = 'msg';
     msg.textContent = 'Detecting…';
     try {
-        const r = await fetch('/api/teraterm-status?auto=1');
+        const url = '/api/teraterm-status?auto=1'
+            + (typed ? '&path=' + encodeURIComponent(typed) : '');
+        const r = await fetch(url);
         const res = await r.json();
-        const found = res.exe || '';
-        if (found) {
-            if (input) input.value = found;
-            msg.className = 'msg ok';
-            msg.textContent = 'Found: ' + found + ' — click Save to keep it.';
+        const host = res.host || {};
+        const hostNote = host.windows ? '' :
+            ' This dashboard is running on ' + escapeHtml(host.system || 'non-Windows')
+            + (host.wsl ? ' (WSL)' : '') + ', not Windows.';
+
+        // If the user typed a path, explain that path specifically.
+        if (typed && res.candidate) {
+            if (res.candidate.ok) {
+                if (input) input.value = res.candidate.resolved;
+                msg.className = 'msg ok';
+                msg.textContent = 'Path is valid: ' + res.candidate.resolved + ' — click Save to keep it.';
+                applyTeraTermStatus(res);
+                return;
+            }
+            msg.className = 'msg err';
+            const reason = res.candidate.reason || 'path not usable';
+            const already = host.system && reason.indexOf(host.system) !== -1;
+            msg.textContent = 'Cannot use that path — ' + reason + '.' + (already ? '' : hostNote);
+            if (res.exe) {
+                msg.textContent += ' Found instead: ' + res.exe;
+                if (input) input.value = res.exe;
+            }
             applyTeraTermStatus(res);
+            return;
+        }
+
+        if (res.exe) {
+            if (input) input.value = res.exe;
+            msg.className = 'msg ok';
+            msg.textContent = 'Found: ' + res.exe + ' — click Save to keep it.';
         } else {
             msg.className = 'msg err';
-            msg.textContent = 'Not found automatically. Paste the full path to ttermpro.exe, then Save.';
-            applyTeraTermStatus(res);
+            msg.textContent = 'Not found automatically. Paste the full path to ttermpro.exe, then Save.' + hostNote;
             if (res.searched && res.searched.length) {
                 msg.textContent += ' Looked in ' + res.searched.length + ' locations.';
             }
         }
+        applyTeraTermStatus(res);
     } catch (e) {
         msg.className = 'msg err';
         msg.textContent = String(e);
@@ -1185,17 +1217,16 @@ def api_save_settings():
     updates = {}
     if "teraterm_exe" in data:
         path = str(data.get("teraterm_exe") or "").strip().strip('"')
-        if path and not path.lower().endswith("ttermpro.exe"):
-            return jsonify({
-                "ok": False,
-                "error": "Path should point to ttermpro.exe (the Tera Term main program)",
-            })
-        if path and not os.path.isfile(path):
-            return jsonify({
-                "ok": False,
-                "error": f"File not found: {path}",
-                "hint": "Paste the full path to ttermpro.exe on this PC",
-            })
+        if path:
+            check = teraterm_launcher.resolve_exe(path)
+            if not check["exe"]:
+                return jsonify({
+                    "ok": False,
+                    "error": f"Cannot use {path}: {check['reason']}",
+                    "tried": check.get("tried", []),
+                    "host": teraterm_launcher.host_platform(),
+                })
+            path = check["exe"]
         updates["teraterm_exe"] = path
 
     if not updates:
@@ -1221,18 +1252,22 @@ def api_save_settings():
 def api_teraterm_status():
     """Where Tera Term was looked for, and whether it was found.
 
-    Pass ?auto=1 to ignore the saved Settings path (used by the Detect button).
+    ?auto=1     ignore the saved Settings path (used by Detect)
+    ?path=...   also report why that specific path does or does not work
     """
     auto = request.args.get("auto") in ("1", "true", "yes")
+    candidate = (request.args.get("path") or "").strip()
     explicit = "" if auto else configured_teraterm_exe()
     found = teraterm_launcher.detect(explicit, TERATERM_SEARCH)
     configured = configured_teraterm_exe()
-    return jsonify({
+
+    payload = {
         "ok": True,
         "found": bool(found["exe"]),
         "exe": found["exe"],
         "macro_runner": found["macro_runner"],
         "configured": configured,
+        "host": teraterm_launcher.host_platform(),
         "source": (
             "auto" if auto else (
                 "settings" if (load_settings().get("teraterm_exe") or "").strip()
@@ -1240,7 +1275,18 @@ def api_teraterm_status():
             )
         ),
         "searched": found["searched"],
-    })
+    }
+
+    if candidate:
+        check = teraterm_launcher.resolve_exe(candidate)
+        payload["candidate"] = {
+            "path": candidate,
+            "ok": bool(check["exe"]),
+            "resolved": check["exe"],
+            "reason": check["reason"],
+            "tried": check.get("tried", []),
+        }
+    return jsonify(payload)
 
 @app.route("/api/teraterm/<target>", methods=["POST"])
 @login_required
