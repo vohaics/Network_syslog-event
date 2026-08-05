@@ -49,6 +49,7 @@ from flask import (
 
 # ====================== CONFIG ======================
 DEVICES_FILE = "devices.json"
+SETTINGS_FILE = "settings.json"
 
 # Dashboard login (CHANGE THESE!)
 DASHBOARD_USER = "admin"
@@ -80,8 +81,9 @@ MAX_CONNECT_FAILURES = 5
 DASHBOARD_PORT = 5000
 
 # ---- Tera Term launcher (runs on the machine hosting this dashboard) ----
-# Set TERATERM_EXE to override auto-detection.
-TERATERM_EXE = os.environ.get("TERATERM_EXE", "")
+# Prefer the path saved in Settings (UI). Environment variable TERATERM_EXE is
+# a fallback when no UI path is set. Auto-detect covers common install folders.
+TERATERM_EXE_ENV = os.environ.get("TERATERM_EXE", "")
 TERATERM_SEARCH = [
     r"C:\Program Files (x86)\teraterm\ttermpro.exe",
     r"C:\Program Files\teraterm\ttermpro.exe",
@@ -92,6 +94,10 @@ TERATERM_SEARCH = [
 # Passing the password on the command line makes it visible in the Windows
 # process list. A .ttl macro keeps it in a temp file instead.
 TERATERM_USE_MACRO = True
+
+DEFAULT_SETTINGS = {
+    "teraterm_exe": "",
+}
 
 # FortiGate / FortiOS does not stream syslog into the CLI session the way
 # Cisco's "terminal monitor" does, so its event log is polled instead.
@@ -151,6 +157,40 @@ def load_devices():
 def save_devices(devices):
     with open(DEVICES_FILE, "w") as f:
         json.dump(devices, f, indent=2)
+
+# -------------------- Settings (per-PC preferences) --------------------
+settings_lock = threading.Lock()
+
+def load_settings():
+    data = dict(DEFAULT_SETTINGS)
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                stored = json.load(f)
+            if isinstance(stored, dict):
+                data.update({k: stored[k] for k in DEFAULT_SETTINGS if k in stored})
+        except Exception as e:
+            print(f"[SETTINGS] load failed: {e}")
+    return data
+
+def save_settings(data: dict):
+    with settings_lock:
+        current = load_settings()
+        current.update(data)
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(current, f, indent=2)
+        return current
+
+def configured_teraterm_exe() -> str:
+    """UI setting first, then TERATERM_EXE env, else empty (auto-detect)."""
+    path = (load_settings().get("teraterm_exe") or "").strip()
+    if path:
+        return path
+    return (TERATERM_EXE_ENV or "").strip()
+
+def resolve_teraterm():
+    """Detect Tera Term using the configured path / env / auto-search."""
+    return teraterm_launcher.detect(configured_teraterm_exe(), TERATERM_SEARCH)
 
 def normalize_device(raw: dict) -> dict:
     """Normalize a device dict from UI / CSV / JSON import."""
@@ -418,12 +458,25 @@ DASHBOARD_HTML = """
         <h1>Cisco Multi-Device Monitor</h1>
         <div class="header-right">
             <button class="btn-sm" id="sound-btn" onclick="toggleSound()">Sound: ON</button>
-            <div class="badge" id="tt-status">Tera Term: …</div>
+            <div class="badge" id="tt-status" onclick="toggleSettings()" style="cursor:pointer;">Tera Term: …</div>
+            <button class="btn-sm" onclick="toggleSettings()">Settings</button>
             <a href="/export" class="btn-sm" style="text-decoration:none;">Export CSV</a>
             <div class="badge" id="last-update">Loading...</div>
             <a href="/logout" class="btn-sm danger" style="text-decoration:none;">Logout</a>
         </div>
     </header>
+
+    <div class="form-card" id="settings-panel" style="display:none;">
+        <h3>Settings</h3>
+        <p class="hint">Each PC can set its own Tera Term path. Saved in <code>settings.json</code> on this machine.</p>
+        <div class="form-row" style="grid-template-columns: 1fr auto auto;">
+            <input id="set-tt-exe" placeholder="C:\\Program Files (x86)\\teraterm\\ttermpro.exe" spellcheck="false">
+            <button class="btn secondary" onclick="detectTeraTerm()">Detect</button>
+            <button class="btn" onclick="saveSettings()">Save</button>
+        </div>
+        <div class="msg" id="settings-msg"></div>
+        <div class="meta" id="settings-detail" style="margin-top:8px;"></div>
+    </div>
 
     <div class="form-card">
         <h3>Import Network List</h3>
@@ -740,9 +793,10 @@ async function openTeraTerm(target) {
         }
         let msg = res.error || 'Could not launch Tera Term';
         if (res.hint) msg += '\\n\\n' + res.hint;
-        if (res.searched) msg += '\\n\\nLooked in:\\n- ' + res.searched.slice(0, 12).join('\\n- ');
         showToast(res.error || 'Could not launch Tera Term', false);
-        if (confirm(msg + '\\n\\nDownload the .ttl macro and run it on your PC instead?')) {
+        if (confirm(msg + '\\n\\nOpen Settings to set the Tera Term path on this PC?\\n\\nOK = Settings · Cancel = download .ttl macro')) {
+            toggleSettings(true);
+        } else {
             window.location = '/api/teraterm/' + encodeURIComponent(target) + '/macro';
         }
     } catch (e) {
@@ -750,25 +804,118 @@ async function openTeraTerm(target) {
     }
 }
 
+function toggleSettings(forceOpen) {
+    const panel = document.getElementById('settings-panel');
+    if (!panel) return;
+    const open = forceOpen === true ? true : panel.style.display === 'none';
+    panel.style.display = open ? 'block' : 'none';
+    if (open) loadSettingsForm();
+}
+
+function applyTeraTermStatus(res) {
+    const el = document.getElementById('tt-status');
+    if (!el) return;
+    if (res.found) {
+        el.textContent = 'Tera Term: ready';
+        el.className = 'badge tt-ok';
+        el.title = (res.exe || '') + (res.source ? ' [' + res.source + ']' : '');
+    } else {
+        el.textContent = 'Tera Term: not found';
+        el.className = 'badge tt-bad';
+        el.title = 'Click to open Settings';
+    }
+    const detail = document.getElementById('settings-detail');
+    if (detail) {
+        if (res.found) {
+            detail.innerHTML = 'Using: <span>' + escapeHtml(res.exe) + '</span> <span style="color:var(--muted)">(' + escapeHtml(res.source || 'auto') + ')</span>';
+        } else {
+            detail.innerHTML = 'Not found. Paste the full path to <code>ttermpro.exe</code> for this PC, then Save.';
+        }
+    }
+}
+
+async function loadSettingsForm() {
+    try {
+        const r = await fetch('/api/settings');
+        const res = await r.json();
+        if (!res.ok) return;
+        const input = document.getElementById('set-tt-exe');
+        if (input) {
+            input.value = res.settings.teraterm_exe || res.teraterm.configured || res.teraterm.exe || '';
+        }
+        applyTeraTermStatus(res.teraterm);
+        const msg = document.getElementById('settings-msg');
+        if (msg) { msg.className = 'msg'; msg.textContent = ''; }
+    } catch (e) { /* ignore */ }
+}
+
+async function saveSettings() {
+    const input = document.getElementById('set-tt-exe');
+    const msg = document.getElementById('settings-msg');
+    const path = (input && input.value || '').trim().replace(/^"|"$/g, '');
+    msg.className = 'msg';
+    msg.textContent = 'Saving…';
+    try {
+        const r = await fetch('/api/settings', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ teraterm_exe: path })
+        });
+        const res = await r.json();
+        if (res.ok) {
+            msg.className = 'msg ok';
+            msg.textContent = path
+                ? 'Saved. Tera Term will use this path on this PC.'
+                : 'Cleared. Auto-detect will be used.';
+            applyTeraTermStatus(res.teraterm);
+            showToast(path ? 'Tera Term path saved' : 'Tera Term path cleared', true);
+        } else {
+            msg.className = 'msg err';
+            msg.textContent = res.error || 'Save failed';
+            if (res.hint) msg.textContent += ' — ' + res.hint;
+        }
+    } catch (e) {
+        msg.className = 'msg err';
+        msg.textContent = String(e);
+    }
+}
+
+async function detectTeraTerm() {
+    const msg = document.getElementById('settings-msg');
+    const input = document.getElementById('set-tt-exe');
+    msg.className = 'msg';
+    msg.textContent = 'Detecting…';
+    try {
+        const r = await fetch('/api/teraterm-status?auto=1');
+        const res = await r.json();
+        const found = res.exe || '';
+        if (found) {
+            if (input) input.value = found;
+            msg.className = 'msg ok';
+            msg.textContent = 'Found: ' + found + ' — click Save to keep it.';
+            applyTeraTermStatus(res);
+        } else {
+            msg.className = 'msg err';
+            msg.textContent = 'Not found automatically. Paste the full path to ttermpro.exe, then Save.';
+            applyTeraTermStatus(res);
+            if (res.searched && res.searched.length) {
+                msg.textContent += ' Looked in ' + res.searched.length + ' locations.';
+            }
+        }
+    } catch (e) {
+        msg.className = 'msg err';
+        msg.textContent = String(e);
+    }
+}
+
 async function checkTeraTerm() {
     try {
         const r = await fetch('/api/teraterm-status');
         const res = await r.json();
-        const el = document.getElementById('tt-status');
-        if (!el) return;
-        if (res.found) {
-            el.textContent = 'Tera Term: ready';
-            el.className = 'badge tt-ok';
-            el.title = res.exe;
-        } else {
-            el.textContent = 'Tera Term: not found';
-            el.className = 'badge tt-bad';
-            el.title = 'Looked in:\\n' + (res.searched || []).join('\\n');
-            el.style.cursor = 'pointer';
-            el.onclick = () => alert('Tera Term (ttermpro.exe) was not found.\\n\\nLooked in:\\n- '
-                + (res.searched || []).join('\\n- ')
-                + '\\n\\nFix: start the dashboard with TERATERM_EXE set, e.g.\\n'
-                + 'set TERATERM_EXE=C:\\\\Program Files (x86)\\\\teraterm\\\\ttermpro.exe');
+        applyTeraTermStatus(res);
+        const input = document.getElementById('set-tt-exe');
+        if (input && !input.value) {
+            input.value = res.configured || res.exe || '';
         }
     } catch (e) { /* ignore */ }
 }
@@ -1010,16 +1157,88 @@ def resolve_target(name_or_ip: str):
     """Look up a device by inventory name first, then by IP address."""
     return find_device(name_or_ip) or find_device_by_host(name_or_ip)
 
+@app.route("/api/settings", methods=["GET"])
+@login_required
+def api_get_settings():
+    settings = load_settings()
+    found = resolve_teraterm()
+    return jsonify({
+        "ok": True,
+        "settings": settings,
+        "teraterm": {
+            "found": bool(found["exe"]),
+            "exe": found["exe"],
+            "macro_runner": found["macro_runner"],
+            "configured": configured_teraterm_exe(),
+            "source": (
+                "settings" if (load_settings().get("teraterm_exe") or "").strip()
+                else ("env" if TERATERM_EXE_ENV else "auto")
+            ),
+            "searched": found["searched"],
+        },
+    })
+
+@app.route("/api/settings", methods=["POST"])
+@login_required
+def api_save_settings():
+    data = request.json or {}
+    updates = {}
+    if "teraterm_exe" in data:
+        path = str(data.get("teraterm_exe") or "").strip().strip('"')
+        if path and not path.lower().endswith("ttermpro.exe"):
+            return jsonify({
+                "ok": False,
+                "error": "Path should point to ttermpro.exe (the Tera Term main program)",
+            })
+        if path and not os.path.isfile(path):
+            return jsonify({
+                "ok": False,
+                "error": f"File not found: {path}",
+                "hint": "Paste the full path to ttermpro.exe on this PC",
+            })
+        updates["teraterm_exe"] = path
+
+    if not updates:
+        return jsonify({"ok": False, "error": "No settings to update"})
+
+    saved = save_settings(updates)
+    found = resolve_teraterm()
+    return jsonify({
+        "ok": True,
+        "settings": saved,
+        "teraterm": {
+            "found": bool(found["exe"]),
+            "exe": found["exe"],
+            "macro_runner": found["macro_runner"],
+            "configured": configured_teraterm_exe(),
+            "source": "settings" if saved.get("teraterm_exe") else "auto",
+            "searched": found["searched"],
+        },
+    })
+
 @app.route("/api/teraterm-status")
 @login_required
 def api_teraterm_status():
-    """Where Tera Term was looked for, and whether it was found."""
-    found = teraterm_launcher.detect(TERATERM_EXE, TERATERM_SEARCH)
+    """Where Tera Term was looked for, and whether it was found.
+
+    Pass ?auto=1 to ignore the saved Settings path (used by the Detect button).
+    """
+    auto = request.args.get("auto") in ("1", "true", "yes")
+    explicit = "" if auto else configured_teraterm_exe()
+    found = teraterm_launcher.detect(explicit, TERATERM_SEARCH)
+    configured = configured_teraterm_exe()
     return jsonify({
         "ok": True,
         "found": bool(found["exe"]),
         "exe": found["exe"],
         "macro_runner": found["macro_runner"],
+        "configured": configured,
+        "source": (
+            "auto" if auto else (
+                "settings" if (load_settings().get("teraterm_exe") or "").strip()
+                else ("env" if TERATERM_EXE_ENV else "auto")
+            )
+        ),
         "searched": found["searched"],
     })
 
@@ -1041,7 +1260,7 @@ def api_teraterm(target):
     transport = resolve_transport(dev)
     result = teraterm_launcher.launch(
         dev, transport,
-        explicit_exe=TERATERM_EXE,
+        explicit_exe=configured_teraterm_exe(),
         search_paths=TERATERM_SEARCH,
         use_macro=TERATERM_USE_MACRO,
     )

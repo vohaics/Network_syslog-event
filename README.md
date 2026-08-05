@@ -235,18 +235,27 @@ set TERATERM_EXE=D:\tools\teraterm\ttermpro.exe
 python cisco_multi_monitor.py
 ```
 
+### Set the Tera Term path in the UI (per PC)
+
+Each PC can have Tera Term installed in a different folder. Click **Settings**
+(or the **Tera Term** badge in the header) and paste the full path to
+`ttermpro.exe`, then **Save**. It is stored in `settings.json` on that machine.
+
+```
+C:\Program Files (x86)\teraterm\ttermpro.exe
+```
+
+**Detect** tries the usual install folders / registry / PATH and fills the field
+for you — still click **Save** to keep it. Clear the field and Save to go back
+to auto-detect.
+
+Priority: UI Settings → `TERATERM_EXE` environment variable → auto-detect.
+
 ### "Tera Term not found"
 
-The header shows a **Tera Term: ready / not found** badge. Click it when red to see
-every location that was checked. Tera Term is looked up in the usual install folders,
-the Windows registry (`App Paths\\ttermpro.exe`), common portable locations, and `PATH`.
-
-If yours lives somewhere else, start the dashboard with the full path:
-
-```powershell
-set TERATERM_EXE=C:\Program Files (x86)\teraterm\ttermpro.exe
-python cisco_multi_monitor.py
-```
+The header badge turns red when `ttermpro.exe` cannot be found. Open Settings,
+paste the path for this PC, and Save. The badge lists how many locations were
+searched when Detect fails.
 
 ### If the dashboard runs on a different machine
 
