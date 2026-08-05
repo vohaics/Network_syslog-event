@@ -11,6 +11,7 @@ Requires: pip install paramiko
 import re
 import socket
 import time
+import os
 
 try:
     import paramiko
@@ -28,7 +29,11 @@ LEGACY_KEX = [
 LEGACY_CIPHERS = ["aes128-cbc", "aes192-cbc", "aes256-cbc", "3des-cbc"]
 LEGACY_KEYS = ["ssh-rsa"]
 
-CLIENT_ID = b"SSH-2.0-NetworkMonitor_1.0\r\n"
+CLIENT_ID = b"SSH-2.0-OpenSSH_8.9\r\n"
+
+# Some appliances (FortiGate in particular) are picky about unknown client
+# identification strings. Presenting a common OpenSSH string avoids resets.
+SSH_CLIENT_ID = os.environ.get("SSH_CLIENT_ID", "OpenSSH_8.9")
 
 
 class SSHSession:
@@ -109,6 +114,10 @@ def _tune_legacy_algorithms():
             if item in known and item not in current:
                 current.append(item)
         setattr(transport, attr, tuple(current))
+
+    # Identify as OpenSSH; appliances sometimes reset unfamiliar clients.
+    if SSH_CLIENT_ID:
+        transport._CLIENT_ID = SSH_CLIENT_ID
 
 
 def open_ssh_shell(dev: dict, timeout: float = 25) -> SSHSession:

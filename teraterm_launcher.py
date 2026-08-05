@@ -22,16 +22,88 @@ import os
 import shutil
 import subprocess
 import tempfile
+import glob
+
+try:
+    import winreg  # Windows only
+except ImportError:
+    winreg = None
+
+EXE_NAMES = ["ttermpro.exe", "ttermpro"]
+
+# Common install roots for glob searching (Tera Term 4 and 5, portable copies)
+GLOB_PATTERNS = [
+    r"C:\Program Files\teraterm*\ttermpro.exe",
+    r"C:\Program Files (x86)\teraterm*\ttermpro.exe",
+    r"C:\Program Files\Tera Term*\ttermpro.exe",
+    r"C:\Program Files (x86)\Tera Term*\ttermpro.exe",
+    r"C:\teraterm*\ttermpro.exe",
+    r"D:\teraterm*\ttermpro.exe",
+    r"C:\tools\teraterm*\ttermpro.exe",
+    r"C:\Users\*\AppData\Local\Programs\teraterm*\ttermpro.exe",
+]
+
+
+def _registry_path() -> str:
+    """Tera Term registers itself under App Paths when installed normally."""
+    if winreg is None:
+        return ""
+    for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        for subkey in (
+            r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\ttermpro.exe",
+            r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\ttermpro.exe",
+        ):
+            try:
+                with winreg.OpenKey(root, subkey) as key:
+                    value, _ = winreg.QueryValueEx(key, "")
+                    if value and os.path.isfile(value):
+                        return value
+            except OSError:
+                continue
+    return ""
+
+
+def detect(explicit: str = "", search_paths=()) -> dict:
+    """Locate Tera Term and report everywhere that was checked."""
+    searched = []
+
+    if explicit:
+        searched.append(f"TERATERM_EXE={explicit}")
+        if os.path.isfile(explicit):
+            return _result(explicit, searched)
+
+    for path in search_paths:
+        searched.append(path)
+        if os.path.isfile(path):
+            return _result(path, searched)
+
+    reg = _registry_path()
+    searched.append("Windows registry (App Paths\\ttermpro.exe)")
+    if reg:
+        return _result(reg, searched)
+
+    for pattern in GLOB_PATTERNS:
+        searched.append(pattern)
+        matches = sorted(glob.glob(pattern))
+        if matches:
+            return _result(matches[0], searched)
+
+    for name in EXE_NAMES:
+        found = shutil.which(name)
+        searched.append(f"PATH: {name}")
+        if found:
+            return _result(found, searched)
+
+    return {"exe": "", "macro_runner": "", "searched": searched}
+
+
+def _result(exe: str, searched: list) -> dict:
+    return {"exe": exe, "macro_runner": find_macro_runner(exe), "searched": searched}
 
 
 def find_teraterm(explicit: str = "", search_paths=()) -> str:
     """Locate ttermpro.exe, or return '' when it is not installed here."""
-    if explicit and os.path.isfile(explicit):
-        return explicit
-    for path in search_paths:
-        if os.path.isfile(path):
-            return path
-    return shutil.which("ttermpro") or shutil.which("ttermpro.exe") or ""
+    return detect(explicit, search_paths)["exe"]
 
 
 def find_macro_runner(teraterm_exe: str) -> str:
@@ -106,21 +178,24 @@ def launch(dev: dict, transport: str, explicit_exe: str = "",
            search_paths=(), use_macro: bool = True) -> dict:
     """Start Tera Term locally. Returns a result dict for the API."""
     macro = build_macro(dev, transport)
-    teraterm_exe = find_teraterm(explicit_exe, search_paths)
+    found = detect(explicit_exe, search_paths)
+    teraterm_exe = found["exe"]
 
     if not teraterm_exe:
         return {
             "ok": False,
             "launched": False,
-            "error": "Tera Term not found on the machine running this dashboard",
+            "error": "Tera Term (ttermpro.exe) was not found on the machine running this dashboard",
             "macro": macro,
+            "searched": found["searched"],
             "hint": (
-                "Install Tera Term here, set the TERATERM_EXE environment "
-                "variable, or download the macro and run it on your PC."
+                "Install Tera Term here, or start the dashboard with "
+                "TERATERM_EXE set to the full path of ttermpro.exe, "
+                "or download the macro and run it on your PC."
             ),
         }
 
-    runner = find_macro_runner(teraterm_exe) if use_macro else ""
+    runner = found["macro_runner"] if use_macro else ""
 
     try:
         if runner:
@@ -140,6 +215,7 @@ def launch(dev: dict, transport: str, explicit_exe: str = "",
             "ok": True,
             "launched": True,
             "method": "macro" if runner else "command line",
+            "exe": teraterm_exe,
             "command": os.path.basename(command[0]),
         }
     except Exception as e:
@@ -147,5 +223,6 @@ def launch(dev: dict, transport: str, explicit_exe: str = "",
             "ok": False,
             "launched": False,
             "error": f"{e.__class__.__name__}: {e}",
+            "exe": teraterm_exe,
             "macro": macro,
         }

@@ -72,7 +72,11 @@ PATTERNS = [
 ]
 
 KEEPALIVE_INTERVAL = 50       # seconds
-RECONNECT_DELAY = 12          # seconds
+RECONNECT_DELAY = 12          # seconds (first retry)
+RECONNECT_MAX_DELAY = 120     # seconds (backoff ceiling)
+# Appliances such as FortiGate lock an admin account out after a few failed
+# attempts, so give up rather than hammering the device forever.
+MAX_CONNECT_FAILURES = 5
 DASHBOARD_PORT = 5000
 
 # ---- Tera Term launcher (runs on the machine hosting this dashboard) ----
@@ -402,6 +406,8 @@ DASHBOARD_HTML = """
     .toast.show { opacity: 1; }
     .toast.good { border-color: var(--green); }
     .toast.bad { border-color: var(--red); }
+    .tt-ok { color: var(--green); border-color: var(--green); }
+    .tt-bad { color: var(--red); border-color: var(--red); }
     .count-badge { color: var(--muted); font-size: 0.85rem; }
     @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } .form-row { grid-template-columns: 1fr; } }
 </style>
@@ -412,6 +418,7 @@ DASHBOARD_HTML = """
         <h1>Cisco Multi-Device Monitor</h1>
         <div class="header-right">
             <button class="btn-sm" id="sound-btn" onclick="toggleSound()">Sound: ON</button>
+            <div class="badge" id="tt-status">Tera Term: …</div>
             <a href="/export" class="btn-sm" style="text-decoration:none;">Export CSV</a>
             <div class="badge" id="last-update">Loading...</div>
             <a href="/logout" class="btn-sm danger" style="text-decoration:none;">Logout</a>
@@ -731,14 +738,39 @@ async function openTeraTerm(target) {
             showToast(`Tera Term opening to ${res.host} (${res.transport.toUpperCase()})`, true);
             return;
         }
-        // Not installed on this machine: offer the macro to run locally.
-        if (confirm((res.error || 'Could not launch Tera Term')
-            + '\\n\\nDownload the .ttl macro and run it on your PC instead?')) {
+        let msg = res.error || 'Could not launch Tera Term';
+        if (res.hint) msg += '\\n\\n' + res.hint;
+        if (res.searched) msg += '\\n\\nLooked in:\\n- ' + res.searched.slice(0, 12).join('\\n- ');
+        showToast(res.error || 'Could not launch Tera Term', false);
+        if (confirm(msg + '\\n\\nDownload the .ttl macro and run it on your PC instead?')) {
             window.location = '/api/teraterm/' + encodeURIComponent(target) + '/macro';
         }
     } catch (e) {
         showToast(String(e), false);
     }
+}
+
+async function checkTeraTerm() {
+    try {
+        const r = await fetch('/api/teraterm-status');
+        const res = await r.json();
+        const el = document.getElementById('tt-status');
+        if (!el) return;
+        if (res.found) {
+            el.textContent = 'Tera Term: ready';
+            el.className = 'badge tt-ok';
+            el.title = res.exe;
+        } else {
+            el.textContent = 'Tera Term: not found';
+            el.className = 'badge tt-bad';
+            el.title = 'Looked in:\\n' + (res.searched || []).join('\\n');
+            el.style.cursor = 'pointer';
+            el.onclick = () => alert('Tera Term (ttermpro.exe) was not found.\\n\\nLooked in:\\n- '
+                + (res.searched || []).join('\\n- ')
+                + '\\n\\nFix: start the dashboard with TERATERM_EXE set, e.g.\\n'
+                + 'set TERATERM_EXE=C:\\\\Program Files (x86)\\\\teraterm\\\\ttermpro.exe');
+        }
+    } catch (e) { /* ignore */ }
 }
 
 function showToast(text, good) {
@@ -796,6 +828,7 @@ async function removeDevice(name) {
 
 refresh();
 setInterval(refresh, 3000);
+checkTeraTerm();
 </script>
 </body>
 </html>
@@ -977,6 +1010,19 @@ def resolve_target(name_or_ip: str):
     """Look up a device by inventory name first, then by IP address."""
     return find_device(name_or_ip) or find_device_by_host(name_or_ip)
 
+@app.route("/api/teraterm-status")
+@login_required
+def api_teraterm_status():
+    """Where Tera Term was looked for, and whether it was found."""
+    found = teraterm_launcher.detect(TERATERM_EXE, TERATERM_SEARCH)
+    return jsonify({
+        "ok": True,
+        "found": bool(found["exe"]),
+        "exe": found["exe"],
+        "macro_runner": found["macro_runner"],
+        "searched": found["searched"],
+    })
+
 @app.route("/api/teraterm/<target>", methods=["POST"])
 @login_required
 def api_teraterm(target):
@@ -1116,6 +1162,12 @@ def describe_error(exc: Exception, transport: str, port: int = 0) -> str:
         return "Port 22 is SSH - change this device's protocol to SSH"
     if "authentication" in lowered or "auth failed" in lowered:
         return "Authentication failed - check username / password"
+    if "reset by peer" in lowered or "econnreset" in lowered:
+        return (
+            "Device reset the connection. Usually admin lockout from repeated "
+            "attempts, all SSH admin sessions in use, or a trusted-host / "
+            "local-in policy. Wait ~60s, close spare Tera Term windows, then Test"
+        )
     if "not a valid rsa" in lowered or "no matching" in lowered:
         return f"SSH algorithm mismatch: {text}"
     if "banner" in lowered:
@@ -1295,6 +1347,7 @@ def monitor_device(dev: dict, stop_event: threading.Event):
     seen_lines = deque(maxlen=400)
     last_poll = 0
     junos_stream_ok = True
+    failures = 0
 
     with status_lock:
         device_status[name] = {
@@ -1317,6 +1370,7 @@ def monitor_device(dev: dict, stop_event: threading.Event):
                     device_status[name]["connected"] = True
                     device_status[name]["last_error"] = ""
                     device_status[name]["vendor"] = vendor
+                failures = 0
                 mode = vendor_mode_label(vendor)
                 print(f"[{name}] Connected ({transport.upper()}, {vendor}, {mode})")
                 last_poll = 0
@@ -1368,18 +1422,35 @@ def monitor_device(dev: dict, stop_event: threading.Event):
 
         except Exception as e:
             reason = describe_error(e, transport, dev.get("port", 0))
+            failures += 1
             print(f"[{name}] Lost: {e}")
-            with status_lock:
-                if name in device_status:
-                    device_status[name]["connected"] = False
-                    device_status[name]["last_error"] = reason
             try:
                 if tn:
                     tn.close()
             except Exception:
                 pass
             tn = None
-            for _ in range(RECONNECT_DELAY * 2):
+
+            if failures >= MAX_CONNECT_FAILURES:
+                with status_lock:
+                    if name in device_status:
+                        device_status[name]["connected"] = False
+                        device_status[name]["last_error"] = (
+                            f"{reason} | stopped after {failures} failed attempts "
+                            f"to avoid locking the account - fix the cause, then Connect again"
+                        )
+                print(f"[{name}] Giving up after {failures} failures (avoiding device lockout)")
+                stop_event.set()
+                break
+
+            delay = min(RECONNECT_DELAY * (2 ** (failures - 1)), RECONNECT_MAX_DELAY)
+            with status_lock:
+                if name in device_status:
+                    device_status[name]["connected"] = False
+                    device_status[name]["last_error"] = (
+                        f"{reason} | retry {failures}/{MAX_CONNECT_FAILURES} in {delay}s"
+                    )
+            for _ in range(int(delay * 2)):
                 if stop_event.is_set():
                     break
                 time.sleep(0.5)

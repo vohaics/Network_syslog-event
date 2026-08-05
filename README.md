@@ -194,6 +194,8 @@ OK   — Shell prompt: FortiGate-100F #
 | `Port 22 is SSH - change this device's protocol to SSH` | Telnet selected for an SSH port |
 | `Authentication failed - check username / password` | Wrong credentials |
 | `SSH banner timeout...` | Appliance waited for client ID / rate-limit / session full — click Test again after closing Tera Term |
+| `Device reset the connection...` | Admin lockout, all SSH admin sessions in use, or a trusted-host/local-in policy |
+| `stopped after N failed attempts` | Retrying was halted on purpose so the account is not locked out — fix the cause, then press Connect again |
 | `Timed out - host unreachable or SSH blocked` | Network/ACL problem |
 | `SSH needs Paramiko: pip install paramiko` | Missing dependency |
 
@@ -230,6 +232,19 @@ Tera Term is found automatically in the usual install folders. If yours is elsew
 
 ```powershell
 set TERATERM_EXE=D:\tools\teraterm\ttermpro.exe
+python cisco_multi_monitor.py
+```
+
+### "Tera Term not found"
+
+The header shows a **Tera Term: ready / not found** badge. Click it when red to see
+every location that was checked. Tera Term is looked up in the usual install folders,
+the Windows registry (`App Paths\\ttermpro.exe`), common portable locations, and `PATH`.
+
+If yours lives somewhere else, start the dashboard with the full path:
+
+```powershell
+set TERATERM_EXE=C:\Program Files (x86)\teraterm\ttermpro.exe
 python cisco_multi_monitor.py
 ```
 
