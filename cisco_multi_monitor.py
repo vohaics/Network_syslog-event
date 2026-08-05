@@ -25,6 +25,7 @@ try:
 except ModuleNotFoundError:               # telnetlib removed in Python 3.13
     from telnet_client import Telnet
 from ssh_client import open_ssh_shell, diagnose_ssh
+import teraterm_launcher
 import socket
 import time
 import re
@@ -34,6 +35,9 @@ import json
 import os
 import csv
 import io
+import shutil
+import subprocess
+import tempfile
 from email.mime.text import MIMEText
 from datetime import datetime
 from collections import deque
@@ -70,6 +74,20 @@ PATTERNS = [
 KEEPALIVE_INTERVAL = 50       # seconds
 RECONNECT_DELAY = 12          # seconds
 DASHBOARD_PORT = 5000
+
+# ---- Tera Term launcher (runs on the machine hosting this dashboard) ----
+# Set TERATERM_EXE to override auto-detection.
+TERATERM_EXE = os.environ.get("TERATERM_EXE", "")
+TERATERM_SEARCH = [
+    r"C:\Program Files (x86)\teraterm\ttermpro.exe",
+    r"C:\Program Files\teraterm\ttermpro.exe",
+    r"C:\Program Files (x86)\teraterm5\ttermpro.exe",
+    r"C:\Program Files\teraterm5\ttermpro.exe",
+    r"C:\Program Files\Tera Term\ttermpro.exe",
+]
+# Passing the password on the command line makes it visible in the Windows
+# process list. A .ttl macro keeps it in a temp file instead.
+TERATERM_USE_MACRO = True
 
 # FortiGate / FortiOS does not stream syslog into the CLI session the way
 # Cisco's "terminal monitor" does, so its event log is polled instead.
@@ -373,6 +391,17 @@ DASHBOARD_HTML = """
     .test-line { font-size: 0.75rem; color: var(--muted); font-family: ui-monospace, Consolas, monospace; word-break: break-word; }
     .test-line.good { color: var(--green); }
     .test-line.bad { color: var(--red); }
+    .connect-cell { white-space: nowrap; }
+    .btn-tt { background: #1e3a5f; color: #93c5fd; border: 1px solid #2c5282; border-radius: 6px;
+              padding: 3px 9px; font-size: 0.72rem; cursor: pointer; margin-right: 5px; }
+    .btn-tt:hover { background: var(--blue); color: #fff; }
+    .toast { position: fixed; bottom: 22px; right: 22px; background: var(--card);
+             border: 1px solid var(--border); color: var(--text); padding: 12px 18px;
+             border-radius: 10px; font-size: 0.88rem; opacity: 0; pointer-events: none;
+             transition: opacity 0.25s; max-width: 420px; }
+    .toast.show { opacity: 1; }
+    .toast.good { border-color: var(--green); }
+    .toast.bad { border-color: var(--red); }
     .count-badge { color: var(--muted); font-size: 0.85rem; }
     @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } .form-row { grid-template-columns: 1fr; } }
 </style>
@@ -445,10 +474,10 @@ DASHBOARD_HTML = """
         </div>
         <table>
             <thead>
-                <tr><th>Time</th><th>Device</th><th>Message</th></tr>
+                <tr><th>Time</th><th>Device</th><th>Message</th><th>Connect</th></tr>
             </thead>
             <tbody id="events-body">
-                <tr><td colspan="3" class="empty">No events yet</td></tr>
+                <tr><td colspan="4" class="empty">No events yet</td></tr>
             </tbody>
         </table>
     </div>
@@ -526,6 +555,7 @@ function renderInventory(list) {
             ? `<button class="btn btn-sm warn" onclick="stopMonitor('${escapeAttr(d.name)}')">Stop</button>`
             : `<button class="btn btn-sm success" onclick="startMonitor('${escapeAttr(d.name)}')">Connect & Monitor</button>`;
         const testBtn = `<button class="btn btn-sm secondary" onclick="testDevice('${escapeAttr(d.name)}')">Test</button>`;
+        const ttBtn = `<button class="btn btn-sm secondary" onclick="openTeraTerm('${escapeAttr(d.name)}')">Tera Term</button>`;
         const errorLine = d.last_error
             ? `<div class="meta err-line">Error: <span style="color:var(--red)">${escapeHtml(d.last_error)}</span></div>`
             : '';
@@ -539,7 +569,7 @@ function renderInventory(list) {
             <div class="meta">Last keepalive: <span>${escapeHtml(d.last_keepalive)}</span></div>
             <div class="meta">Last event: <span>${escapeHtml(d.last_event)}</span></div>
             ${errorLine}
-            <div class="card-actions">${monBtn}${testBtn}</div>
+            <div class="card-actions">${monBtn}${testBtn}${ttBtn}</div>
             <div class="test-out" id="test-${escapeAttr(d.name)}">${testResults[d.name] || ''}</div>
         `;
         devicesEl.appendChild(div);
@@ -589,13 +619,24 @@ function applyFilter() {
     let filtered = filter === "all" ? allEvents : allEvents.filter(e => e.device === filter);
 
     if (filtered.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="3" class="empty">No events yet</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="4" class="empty">No events yet</td></tr>';
         count.textContent = '0 events';
     } else {
         tbody.innerHTML = '';
         filtered.forEach(e => {
             const tr = document.createElement('tr');
-            tr.innerHTML = `<td class="time">${escapeHtml(e.time)}</td><td><span class="device-tag">${escapeHtml(e.device)}</span></td><td>${escapeHtml(e.msg)}</td>`;
+            const targets = [];
+            if (e.device) targets.push({ label: e.device, target: e.device });
+            (e.ips || []).forEach(ip => {
+                if (ip !== e.host) targets.push({ label: ip, target: ip });
+            });
+            const buttons = targets.map(t =>
+                `<button class="btn-tt" title="Open Tera Term to ${escapeHtml(t.label)}" onclick="openTeraTerm('${escapeAttr(t.target)}')">${escapeHtml(t.label)}</button>`
+            ).join('');
+            tr.innerHTML = `<td class="time">${escapeHtml(e.time)}</td>`
+                + `<td><span class="device-tag">${escapeHtml(e.device)}</span></td>`
+                + `<td>${escapeHtml(e.msg)}</td>`
+                + `<td class="connect-cell">${buttons}</td>`;
             tbody.appendChild(tr);
         });
         count.textContent = filtered.length + ' events';
@@ -680,6 +721,36 @@ function showTest(name, html) {
     testResults[name] = html;
     const box = document.getElementById('test-' + name);
     if (box) box.innerHTML = html;
+}
+
+async function openTeraTerm(target) {
+    try {
+        const r = await fetch('/api/teraterm/' + encodeURIComponent(target), { method: 'POST' });
+        const res = await r.json();
+        if (res.ok && res.launched) {
+            showToast(`Tera Term opening to ${res.host} (${res.transport.toUpperCase()})`, true);
+            return;
+        }
+        // Not installed on this machine: offer the macro to run locally.
+        if (confirm((res.error || 'Could not launch Tera Term')
+            + '\\n\\nDownload the .ttl macro and run it on your PC instead?')) {
+            window.location = '/api/teraterm/' + encodeURIComponent(target) + '/macro';
+        }
+    } catch (e) {
+        showToast(String(e), false);
+    }
+}
+
+function showToast(text, good) {
+    let el = document.getElementById('toast');
+    if (!el) {
+        el = document.createElement('div');
+        el.id = 'toast';
+        document.body.appendChild(el);
+    }
+    el.textContent = text;
+    el.className = 'toast show ' + (good ? 'good' : 'bad');
+    setTimeout(() => { el.className = 'toast'; }, 4000);
 }
 
 async function testDevice(name) {
@@ -894,6 +965,61 @@ def api_test_device(name):
         "steps": steps,
     })
 
+def find_device_by_host(ip: str):
+    """Inventory entry whose host matches this IP."""
+    with inventory_lock:
+        for d in load_devices():
+            if d.get("host") == ip:
+                return d
+    return None
+
+def resolve_target(name_or_ip: str):
+    """Look up a device by inventory name first, then by IP address."""
+    return find_device(name_or_ip) or find_device_by_host(name_or_ip)
+
+@app.route("/api/teraterm/<target>", methods=["POST"])
+@login_required
+def api_teraterm(target):
+    """Open Tera Term to a device, using the stored credentials.
+
+    `target` is an inventory name or an IP address, so events that mention an
+    IP can launch a session directly.
+    """
+    dev = resolve_target(target)
+    if not dev:
+        return jsonify({
+            "ok": False,
+            "error": f"{target} is not in the inventory - add it with a username and password first",
+        })
+
+    transport = resolve_transport(dev)
+    result = teraterm_launcher.launch(
+        dev, transport,
+        explicit_exe=TERATERM_EXE,
+        search_paths=TERATERM_SEARCH,
+        use_macro=TERATERM_USE_MACRO,
+    )
+    result["device"] = dev["name"]
+    result["host"] = dev["host"]
+    result["transport"] = transport
+    return jsonify(result)
+
+@app.route("/api/teraterm/<target>/macro")
+@login_required
+def api_teraterm_macro(target):
+    """Download the .ttl macro to run Tera Term on another PC."""
+    dev = resolve_target(target)
+    if not dev:
+        return Response(f"; {target} is not in the inventory\r\n",
+                        mimetype="text/plain", status=404)
+    macro = teraterm_launcher.build_macro(dev, resolve_transport(dev))
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", dev["name"])
+    return Response(
+        macro,
+        mimetype="text/plain",
+        headers={"Content-Disposition": f"attachment;filename=teraterm_{safe}.ttl"},
+    )
+
 @app.route("/api/devices/<name>/stop", methods=["POST"])
 @login_required
 def api_stop_monitor(name):
@@ -953,9 +1079,28 @@ def send_email(subject: str, body: str):
     except Exception as e:
         print(f"[EMAIL ERROR] {e}")
 
+IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+
+def extract_ips(text: str) -> list:
+    """IPv4 addresses in a log line, ignoring obvious non-hosts."""
+    found = []
+    for ip in IP_RE.findall(text or ""):
+        parts = ip.split(".")
+        if all(p.isdigit() and int(p) < 256 for p in parts) and ip not in found:
+            found.append(ip)
+    return found
+
 def add_event(device_name: str, msg: str):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    events.appendleft({"time": now, "device": device_name, "msg": msg})
+    dev = find_device(device_name)
+    entry = {
+        "time": now,
+        "device": device_name,
+        "msg": msg,
+        "host": (dev or {}).get("host", ""),
+        "ips": extract_ips(msg),
+    }
+    events.appendleft(entry)
     with status_lock:
         if device_name in device_status:
             device_status[device_name]["last_event"] = now

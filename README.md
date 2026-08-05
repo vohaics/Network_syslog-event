@@ -201,13 +201,55 @@ OK   — Shell prompt: FortiGate-100F #
 
 ## Tera Term and this tool
 
-**Yes — using Tera Term is OK.**
+**Yes — using Tera Term is OK, and the dashboard can launch it for you.**
+
+### Click to connect
+
+Every device card has a **Tera Term** button, and every row in **Recent Events** has a
+**Connect** column. Clicking a button opens Tera Term on the PC running this dashboard,
+connecting to that device with the credentials already stored in the inventory
+(SSH or Telnet, whichever the device uses).
+
+Event rows show one button per target:
+
+* the device that reported the event
+* any **IP address found inside the log message** that also exists in your inventory
+  (for example the BGP/OSPF neighbour that just went down)
+
+So when an event arrives mentioning an IP, you can jump straight into a CLI session
+on that IP without typing the address or password.
+
+### How the session is started
+
+By default a temporary `.ttl` macro is generated and run with `ttpmacro.exe`. This
+keeps the password out of the Windows process list and also handles Telnet
+username/password prompts and `enable` automatically. Set
+`TERATERM_USE_MACRO = False` in the script to use a plain command line instead.
+
+Tera Term is found automatically in the usual install folders. If yours is elsewhere:
+
+```powershell
+set TERATERM_EXE=D:\tools\teraterm\ttermpro.exe
+python cisco_multi_monitor.py
+```
+
+### If the dashboard runs on a different machine
+
+The launch happens on whichever machine runs the dashboard. When Tera Term is not
+installed there, the button offers to **download the `.ttl` macro** instead — save it
+and double-click it on your own PC. You can also fetch it directly:
+
+```
+/api/teraterm/<device-name-or-ip>/macro
+```
+
+### Notes
 
 - This monitor opens its **own** session (separate from Tera Term), over Telnet or SSH.
 - You can keep using Tera Term for manual CLI work while the dashboard monitors syslog.
-- Use the **same username/password** from your network list in both tools.
 - Cisco / FortiGate / Juniper all have session limits; if you hit “no more connections”, free a session or raise the limit.
-- Whatever protocol Tera Term uses for a device (Telnet on 23, SSH on 22), select the same one here.
+- Only devices in the inventory can be launched — an unknown IP returns a clear error,
+  because no credentials are stored for it.
 
 ---
 
