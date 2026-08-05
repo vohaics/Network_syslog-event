@@ -25,14 +25,28 @@ It keeps persistent Telnet sessions, enables `terminal monitor`, watches for cri
 
 ## Requirements
 
-- Python 3.8 or higher
+- Python 3.8 or higher (**including 3.13+**)
 - Flask
+- Paramiko (only if you monitor devices over **SSH**)
 
 ```bash
-pip install flask
+pip install -r requirements.txt
 ```
 
-(`telnetlib`, `smtplib`, `json`, `csv` are part of the Python standard library.)
+(`smtplib`, `json`, `csv` are part of the Python standard library.)
+
+### Python 3.13 and newer
+
+`telnetlib` was removed from the standard library in Python 3.13. The bundled
+`telnet_client.py` is used automatically in that case, so keep it next to
+`cisco_multi_monitor.py`:
+
+```
+cisco_multi_monitor.py
+telnet_client.py
+```
+
+No extra install is needed.
 
 ---
 
@@ -40,6 +54,7 @@ pip install flask
 
 1. Download the files:
    - `cisco_multi_monitor.py`
+   - `telnet_client.py` (needed on Python 3.13+)
    - `README.md` (this file)
 
 2. Edit the configuration section at the top of `cisco_multi_monitor.py`:
@@ -65,6 +80,8 @@ app.secret_key = "change-this-to-a-long-random-string-please-32chars-min"
 ```bash
 python cisco_multi_monitor.py
 ```
+
+On Windows you can also just double-click **`run.bat`** (it installs Flask if missing).
 
 4. Open your browser:
 
@@ -202,9 +219,38 @@ sudo systemctl enable --now cisco-monitor
 
 ---
 
+## Telnet or SSH
+
+Both are supported. Pick the protocol in the **Add New Device** form, or let the port decide:
+
+| Port | Protocol used |
+|------|---------------|
+| 23 | Telnet |
+| 22 | SSH (needs `pip install paramiko`) |
+
+If Tera Term connects to a device on **port 22**, that device is SSH-only — choose **SSH** here too. Selecting Telnet against port 22 will sit in *Reconnecting…* forever, because the device never sends a `Username:` prompt.
+
+In `devices.json` the protocol is stored per device:
+
+```json
+{
+  "name": "Core-Router",
+  "host": "10.136.110.254",
+  "port": 22,
+  "transport": "ssh",
+  "username": "admin",
+  "password": "yourpass",
+  "enable_password": ""
+}
+```
+
+Older IOS images sometimes only offer legacy SSH key exchange and ciphers; those legacy algorithms are enabled automatically.
+
+---
+
 ## Limitations & Notes
 
-- Uses **Telnet** only (not SSH). If your devices only allow SSH, the script needs to be adapted (e.g. with `paramiko` or `netmiko`).
+- Supports **Telnet and SSH**. SSH requires Paramiko (`pip install paramiko`).
 - Requires that the Cisco device still generates the syslog messages to the monitor session (normal default behavior).
 - Device `exec-timeout` should not be extremely short; the keepalive interval is 50 seconds by default.
 - This tool does **not** modify any configuration on the Cisco devices.
@@ -216,7 +262,11 @@ sudo systemctl enable --now cisco-monitor
 
 | Problem | Possible cause / solution |
 |---------|---------------------------|
-| Cannot connect | Check IP, port, username, password, and that Telnet is allowed |
+| `ModuleNotFoundError: No module named 'telnetlib'` | Python 3.13+ removed `telnetlib`. Make sure `telnet_client.py` sits in the same folder as `cisco_multi_monitor.py` (it is used automatically) |
+| Stuck on *Reconnecting…* but Tera Term logs in fine | Tera Term is probably using **SSH (port 22)**. Set the device protocol to **SSH** |
+| `SSH requires Paramiko` | Run `pip install paramiko` |
+| SSH fails with "no matching key exchange/cipher" | Very old IOS image; legacy algorithms are already enabled, so upgrade the IOS SSH config or use Telnet for that device |
+| Cannot connect | Check IP, port, username, password, and that Telnet/SSH is allowed |
 | Session drops often | Lower `KEEPALIVE_INTERVAL` or check device `exec-timeout` |
 | No email received | Check SMTP settings and Gmail App Password |
 | No events appear | Confirm the device is generating the expected syslog messages (`terminal monitor` works when you login manually) |
