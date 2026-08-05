@@ -25,14 +25,27 @@ It keeps persistent Telnet sessions, enables `terminal monitor`, watches for cri
 
 ## Requirements
 
-- Python 3.8 or higher
+- Python 3.8 or higher (**including 3.13+**)
 - Flask
 
 ```bash
 pip install flask
 ```
 
-(`telnetlib`, `smtplib`, `json`, `csv` are part of the Python standard library.)
+(`smtplib`, `json`, `csv` are part of the Python standard library.)
+
+### Python 3.13 and newer
+
+`telnetlib` was removed from the standard library in Python 3.13. The bundled
+`telnet_client.py` is used automatically in that case, so keep it next to
+`cisco_multi_monitor.py`:
+
+```
+cisco_multi_monitor.py
+telnet_client.py
+```
+
+No extra install is needed.
 
 ---
 
@@ -40,6 +53,7 @@ pip install flask
 
 1. Download the files:
    - `cisco_multi_monitor.py`
+   - `telnet_client.py` (needed on Python 3.13+)
    - `README.md` (this file)
 
 2. Edit the configuration section at the top of `cisco_multi_monitor.py`:
@@ -65,6 +79,8 @@ app.secret_key = "change-this-to-a-long-random-string-please-32chars-min"
 ```bash
 python cisco_multi_monitor.py
 ```
+
+On Windows you can also just double-click **`run.bat`** (it installs Flask if missing).
 
 4. Open your browser:
 
@@ -216,6 +232,7 @@ sudo systemctl enable --now cisco-monitor
 
 | Problem | Possible cause / solution |
 |---------|---------------------------|
+| `ModuleNotFoundError: No module named 'telnetlib'` | Python 3.13+ removed `telnetlib`. Make sure `telnet_client.py` sits in the same folder as `cisco_multi_monitor.py` (it is used automatically) |
 | Cannot connect | Check IP, port, username, password, and that Telnet is allowed |
 | Session drops often | Lower `KEEPALIVE_INTERVAL` or check device `exec-timeout` |
 | No email received | Check SMTP settings and Gmail App Password |
