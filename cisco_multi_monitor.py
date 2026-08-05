@@ -24,7 +24,8 @@ try:
     from telnetlib import Telnet          # Python <= 3.12
 except ModuleNotFoundError:               # telnetlib removed in Python 3.13
     from telnet_client import Telnet
-from ssh_client import open_ssh_session
+from ssh_client import open_ssh_shell, diagnose_ssh
+import socket
 import time
 import re
 import smtplib
@@ -69,6 +70,18 @@ PATTERNS = [
 KEEPALIVE_INTERVAL = 50       # seconds
 RECONNECT_DELAY = 12          # seconds
 DASHBOARD_PORT = 5000
+
+# FortiGate / FortiOS does not stream syslog into the CLI session the way
+# Cisco's "terminal monitor" does, so its event log is polled instead.
+FORTIOS_POLL_INTERVAL = 20    # seconds
+FORTIOS_PATTERNS = [
+    r"status=down",
+    r"link\s*down",
+    r'logdesc="Link monitor status changed"',
+    r'logdesc="Interface status changed"',
+    r"action=(interface-stat-change|link-monitor|tunnel-down)",
+    r"tunnel[-_ ]?down",
+]
 # ====================================================
 
 # Shared state
@@ -137,11 +150,18 @@ def normalize_device(raw: dict) -> dict:
     if not username or not password:
         raise ValueError(f"username/password required for {name}")
 
+    vendor = str(raw.get("vendor") or raw.get("platform") or "").strip().lower()
+    if vendor.startswith("forti"):
+        vendor = "fortios"
+    elif vendor and vendor != "cisco":
+        vendor = "cisco"
+
     return {
         "name": name,
         "host": host,
         "port": port,
         "transport": transport,
+        "vendor": vendor,          # empty means auto-detect from the CLI prompt
         "username": username,
         "password": password,
         "enable_password": enable_password,
@@ -219,6 +239,7 @@ def inventory_public():
             "host": d["host"],
             "port": d.get("port", 23),
             "transport": resolve_transport(d),
+            "vendor": st.get("vendor") or d.get("vendor") or "",
             "username": d.get("username", ""),
             "monitoring": monitoring,
             "connected": bool(st.get("connected")),
@@ -331,6 +352,10 @@ DASHBOARD_HTML = """
     .msg.ok { color: var(--green); }
     .msg.err { color: var(--red); }
     .err-line { line-height: 1.35; word-break: break-word; }
+    .test-out { margin-top: 10px; display: grid; gap: 4px; }
+    .test-line { font-size: 0.75rem; color: var(--muted); font-family: ui-monospace, Consolas, monospace; word-break: break-word; }
+    .test-line.good { color: var(--green); }
+    .test-line.bad { color: var(--red); }
     .count-badge { color: var(--muted); font-size: 0.85rem; }
     @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } .form-row { grid-template-columns: 1fr; } }
 </style>
@@ -377,6 +402,11 @@ DASHBOARD_HTML = """
                 <option value="telnet">Telnet</option>
                 <option value="ssh">SSH</option>
             </select>
+            <select id="f-vendor" class="filter-select">
+                <option value="">Auto-detect</option>
+                <option value="cisco">Cisco IOS</option>
+                <option value="fortios">FortiGate</option>
+            </select>
             <input id="f-port" placeholder="Port" value="23">
             <input id="f-user" placeholder="Username" required>
             <input id="f-pass" type="password" placeholder="Password" required>
@@ -410,6 +440,7 @@ DASHBOARD_HTML = """
 let lastEventCount = 0;
 let allEvents = [];
 let allInventory = [];
+let testResults = {};
 let soundEnabled = localStorage.getItem('soundEnabled') !== 'false';
 
 const audio = new Audio("data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdH2Onp+gnZ2dm5qZmJeXl5aVlZSTk5KRkZCPj46NjYyLi4qJiYiHh4aFhYSDgoGAf39+fX18e3t6eXl4d3d2dXV0c3NycnFwcG9vbm1tbGxra2pqaWloaGdnZmVlZGRjY2JiYWFgX19eXl1dXFxbW1paWVlYWFdXVlZVVVRUU1NSUlFRUFBPTk5NTUxLS0pKSUlISEdHRkZFRURDQ0JCQUFAPz8+Pj09PDw7Ozo6OTk4ODc3NjY1NTQ0MzMyMjExMDAvLy4uLS0sLCsrKioqKSkpKCgoJycnJiYmJSUlJCQkIyMjIiIiISEhICAgHx8fHh4eHR0dHBwcGxsbGhoaGRkZGBgYFxcXFhYWFRUVFBQUExMTEhISERER");
@@ -476,6 +507,7 @@ function renderInventory(list) {
         const monBtn = d.monitoring
             ? `<button class="btn btn-sm warn" onclick="stopMonitor('${escapeAttr(d.name)}')">Stop</button>`
             : `<button class="btn btn-sm success" onclick="startMonitor('${escapeAttr(d.name)}')">Connect & Monitor</button>`;
+        const testBtn = `<button class="btn btn-sm secondary" onclick="testDevice('${escapeAttr(d.name)}')">Test</button>`;
         const errorLine = d.last_error
             ? `<div class="meta err-line">Error: <span style="color:var(--red)">${escapeHtml(d.last_error)}</span></div>`
             : '';
@@ -483,13 +515,14 @@ function renderInventory(list) {
             <button class="btn-remove" onclick="removeDevice('${escapeAttr(d.name)}')">Remove</button>
             <h3><span class="status-dot ${st.dot}"></span>${escapeHtml(d.name)}</h3>
             <div class="meta">Host: <span>${escapeHtml(d.host)}:${d.port}</span></div>
-            <div class="meta">Protocol: <span>${(d.transport || 'telnet').toUpperCase()}</span></div>
+            <div class="meta">Protocol: <span>${(d.transport || 'telnet').toUpperCase()}${d.vendor ? ' / ' + d.vendor.toUpperCase() : ''}</span></div>
             <div class="meta">User: <span>${escapeHtml(d.username)}</span></div>
             <div class="meta">Status: <span style="color:${st.color}">${st.text}</span></div>
             <div class="meta">Last keepalive: <span>${escapeHtml(d.last_keepalive)}</span></div>
             <div class="meta">Last event: <span>${escapeHtml(d.last_event)}</span></div>
             ${errorLine}
-            <div class="card-actions">${monBtn}</div>
+            <div class="card-actions">${monBtn}${testBtn}</div>
+            <div class="test-out" id="test-${escapeAttr(d.name)}">${testResults[d.name] || ''}</div>
         `;
         devicesEl.appendChild(div);
     });
@@ -600,6 +633,7 @@ async function addDevice() {
         name: document.getElementById('f-name').value.trim(),
         host: document.getElementById('f-host').value.trim(),
         transport: transport,
+        vendor: document.getElementById('f-vendor').value,
         port: parseInt(document.getElementById('f-port').value) || (transport === 'ssh' ? 22 : 23),
         username: document.getElementById('f-user').value.trim(),
         password: document.getElementById('f-pass').value,
@@ -621,6 +655,31 @@ async function addDevice() {
         refresh();
     } else {
         alert(res.error || "Failed to add device");
+    }
+}
+
+function showTest(name, html) {
+    testResults[name] = html;
+    const box = document.getElementById('test-' + name);
+    if (box) box.innerHTML = html;
+}
+
+async function testDevice(name) {
+    showTest(name, '<div class="test-line">Testing…</div>');
+    try {
+        const r = await fetch('/api/devices/' + encodeURIComponent(name) + '/test', { method: 'POST' });
+        const res = await r.json();
+        if (!res.ok) {
+            showTest(name, `<div class="test-line bad">${escapeHtml(res.error || 'Test failed')}</div>`);
+            return;
+        }
+        const header = `<div class="test-line">Protocol ${escapeHtml(res.transport.toUpperCase())}`
+            + (res.vendor ? ` · detected ${escapeHtml(res.vendor.toUpperCase())}` : '') + `</div>`;
+        showTest(name, header + res.steps.map(s =>
+            `<div class="test-line ${s.ok ? 'good' : 'bad'}">${s.ok ? 'OK' : 'FAIL'} — ${escapeHtml(s.step)}: ${escapeHtml(s.detail)}</div>`
+        ).join(''));
+    } catch (e) {
+        showTest(name, `<div class="test-line bad">${escapeHtml(String(e))}</div>`);
     }
 }
 
@@ -771,6 +830,51 @@ def api_start_monitor(name):
     start_device_monitor(dev)
     return jsonify({"ok": True})
 
+@app.route("/api/devices/<name>/test", methods=["POST"])
+@login_required
+def api_test_device(name):
+    """Report each connection stage so a failure can be pinpointed."""
+    dev = find_device(name)
+    if not dev:
+        return jsonify({"ok": False, "error": "Device not found in inventory"})
+
+    transport = resolve_transport(dev)
+    if transport == "ssh":
+        steps = diagnose_ssh(dev)
+    else:
+        steps = []
+        try:
+            with socket.create_connection((dev["host"], int(dev["port"])), 8):
+                pass
+            steps.append({"step": f"TCP connect to {dev['host']}:{dev['port']}",
+                          "ok": True, "detail": "open"})
+        except Exception as e:
+            steps.append({"step": f"TCP connect to {dev['host']}:{dev['port']}",
+                          "ok": False, "detail": str(e)})
+            return jsonify({"ok": True, "transport": transport, "steps": steps})
+        session = None
+        try:
+            session, prompt = open_telnet_session(dev)
+            steps.append({"step": "Telnet login", "ok": True,
+                          "detail": prompt.strip()[-200:] or "(no output)"})
+        except Exception as e:
+            steps.append({"step": "Telnet login", "ok": False,
+                          "detail": f"{e.__class__.__name__}: {e}"})
+        finally:
+            if session:
+                try:
+                    session.close()
+                except Exception:
+                    pass
+
+    prompt_detail = " ".join(s["detail"] for s in steps if s.get("ok"))
+    return jsonify({
+        "ok": True,
+        "transport": transport,
+        "vendor": detect_vendor(dev, prompt_detail),
+        "steps": steps,
+    })
+
 @app.route("/api/devices/<name>/stop", methods=["POST"])
 @login_required
 def api_stop_monitor(name):
@@ -865,6 +969,7 @@ def describe_error(exc: Exception, transport: str, port: int = 0) -> str:
     return text[:160]
 
 def open_telnet_session(dev: dict):
+    """Log in over Telnet and return (session, text seen at the prompt)."""
     tn = Telnet(dev["host"], dev["port"], timeout=12)
 
     tn.read_until(b"Username:", timeout=8)
@@ -872,10 +977,10 @@ def open_telnet_session(dev: dict):
     tn.read_until(b"Password:", timeout=8)
     tn.write(dev["password"].encode() + b"\n")
 
-    idx, _, _ = tn.expect([b">", b"#"], timeout=8)
+    idx, _, text = tn.expect([b">", b"#"], timeout=8)
     if idx == -1:
         raise RuntimeError(
-            "No Cisco prompt received. If this device uses SSH (port 22), "
+            "No CLI prompt received. If this device uses SSH (port 22), "
             "set its protocol to SSH."
         )
     if idx == 0:
@@ -883,20 +988,81 @@ def open_telnet_session(dev: dict):
         if dev.get("enable_password"):
             tn.read_until(b"Password:", timeout=5)
             tn.write(dev["enable_password"].encode() + b"\n")
-        tn.expect([b"#"], timeout=8)
+        _, _, text = tn.expect([b"#"], timeout=8)
 
-    tn.write(b"terminal length 0\n")
-    tn.write(b"terminal monitor\n")
-    tn.write(b"\n")
-    time.sleep(0.3)
-    tn.read_very_eager()
-    return tn
+    return tn, text.decode(errors="ignore")
 
 def open_session(dev: dict):
-    """Open a Telnet or SSH monitoring session depending on the device."""
+    """Open a session and return (session, vendor)."""
     if resolve_transport(dev) == "ssh":
-        return open_ssh_session(dev)
-    return open_telnet_session(dev)
+        session = open_ssh_shell(dev)
+        session.write(b"\n")
+        _, _, text = session.expect([b"#", b"$", b">"], timeout=12)
+        prompt = text.decode(errors="ignore")
+        if prompt.strip().endswith(">") and dev.get("enable_password"):
+            session.write(b"enable\n")
+            session.read_until(b"assword", timeout=5)
+            session.write(dev["enable_password"].encode() + b"\n")
+            _, _, text = session.expect([b"#"], timeout=8)
+            prompt = text.decode(errors="ignore")
+    else:
+        session, prompt = open_telnet_session(dev)
+
+    vendor = detect_vendor(dev, prompt)
+    prepare_session(session, vendor)
+    return session, vendor
+
+def detect_vendor(dev: dict, prompt_text: str) -> str:
+    """'fortios' or 'cisco', from the device setting or the CLI prompt."""
+    declared = str(dev.get("vendor") or dev.get("platform") or "").strip().lower()
+    if declared.startswith("forti"):
+        return "fortios"
+    if declared:
+        return "cisco"
+    if re.search(r"forti", prompt_text or "", re.IGNORECASE):
+        return "fortios"
+    return "cisco"
+
+def prepare_session(session, vendor: str):
+    """Send the vendor's setup commands. No device configuration is changed."""
+    if vendor == "fortios":
+        # Prime the log filters used by each poll.
+        for cmd in (b"execute log filter category event\n",
+                    b"execute log filter view-lines 30\n"):
+            session.write(cmd)
+            time.sleep(0.4)
+    else:
+        session.write(b"terminal length 0\n")
+        session.write(b"terminal monitor\n")
+        session.write(b"\n")
+    time.sleep(0.4)
+    session.read_very_eager()
+
+def match_lines(name: str, text: str, patterns: list, seen: deque):
+    """Record new matching lines, skipping ones already reported for this device."""
+    for line in text.splitlines():
+        line = line.strip()
+        if len(line) < 8 or line in seen:
+            continue
+        for pat in patterns:
+            if re.search(pat, line, re.IGNORECASE):
+                seen.append(line)
+                print(f"[{name}] {line}")
+                add_event(name, line)
+                break
+
+def collect_output(session, seconds: float = 3.0) -> str:
+    """Read for a while, answering pagination prompts."""
+    deadline = time.monotonic() + seconds
+    chunks = []
+    while time.monotonic() < deadline:
+        data = session.read_very_eager().decode(errors="ignore")
+        if data:
+            chunks.append(data)
+            if "--More--" in data or "(q)uit" in data:
+                session.write(b" ")
+        time.sleep(0.25)
+    return "".join(chunks)
 
 # -------------------- Monitor --------------------
 def monitor_device(dev: dict, stop_event: threading.Event):
@@ -905,6 +1071,10 @@ def monitor_device(dev: dict, stop_event: threading.Event):
     tn = None
     last_keepalive = 0
 
+    vendor = detect_vendor(dev, "")
+    seen_lines = deque(maxlen=400)
+    last_poll = 0
+
     with status_lock:
         device_status[name] = {
             "connected": False,
@@ -912,6 +1082,7 @@ def monitor_device(dev: dict, stop_event: threading.Event):
             "last_event": device_status.get(name, {}).get("last_event", "-"),
             "host": dev["host"],
             "transport": transport,
+            "vendor": vendor,
             "last_error": ""
         }
 
@@ -919,12 +1090,27 @@ def monitor_device(dev: dict, stop_event: threading.Event):
         try:
             if tn is None:
                 print(f"[{name}] Connecting to {dev['host']}:{dev['port']} over {transport.upper()}...")
-                tn = open_session(dev)
+                tn, vendor = open_session(dev)
 
                 with status_lock:
                     device_status[name]["connected"] = True
                     device_status[name]["last_error"] = ""
-                print(f"[{name}] Connected + terminal monitor ON ({transport.upper()})")
+                    device_status[name]["vendor"] = vendor
+                mode = "log polling" if vendor == "fortios" else "terminal monitor"
+                print(f"[{name}] Connected ({transport.upper()}, {vendor}, {mode})")
+                last_poll = 0
+
+            if vendor == "fortios":
+                if time.time() - last_poll > FORTIOS_POLL_INTERVAL:
+                    tn.write(b"execute log display\n")
+                    data = collect_output(tn, seconds=3.0)
+                    last_poll = time.time()
+                    with status_lock:
+                        device_status[name]["last_keepalive"] = datetime.now().strftime("%H:%M:%S")
+                    match_lines(name, data, FORTIOS_PATTERNS, seen_lines)
+                else:
+                    time.sleep(0.5)
+                continue
 
             data = tn.read_very_eager().decode(errors="ignore")
             if data:

@@ -10,6 +10,7 @@ Requires: pip install paramiko
 """
 
 import re
+import socket
 import time
 
 try:
@@ -93,16 +94,22 @@ class SSHSession:
 
 
 def _tune_legacy_algorithms():
-    """Allow legacy KEX/ciphers used by older Cisco IOS images."""
+    """Enable legacy KEX/ciphers used by older network gear.
+
+    Only algorithms this Paramiko build actually implements are added.
+    Advertising unimplemented names breaks the handshake, which surfaces as
+    confusing "no banner" / reset errors.
+    """
     transport = paramiko.Transport
-    for attr, extra in (
-        ("_preferred_kex", LEGACY_KEX),
-        ("_preferred_ciphers", LEGACY_CIPHERS),
-        ("_preferred_keys", LEGACY_KEYS),
-    ):
+    supported = (
+        ("_preferred_kex", LEGACY_KEX, getattr(transport, "_kex_info", {})),
+        ("_preferred_ciphers", LEGACY_CIPHERS, getattr(transport, "_cipher_info", {})),
+        ("_preferred_keys", LEGACY_KEYS, getattr(transport, "_key_info", {})),
+    )
+    for attr, extra, known in supported:
         current = list(getattr(transport, attr, ()))
         for item in extra:
-            if item not in current:
+            if item in known and item not in current:
                 current.append(item)
         setattr(transport, attr, tuple(current))
 
@@ -148,3 +155,94 @@ def open_ssh_session(dev: dict, timeout: float = 15) -> SSHSession:
     time.sleep(0.4)
     session.read_very_eager()
     return session
+
+
+def open_ssh_shell(dev: dict, timeout: float = 15) -> SSHSession:
+    """Log in over SSH and return the shell without sending any vendor commands."""
+    if paramiko is None:
+        raise RuntimeError("SSH requires Paramiko. Install it with: pip install paramiko")
+
+    _tune_legacy_algorithms()
+
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        hostname=dev["host"],
+        port=int(dev.get("port", 22)),
+        username=dev["username"],
+        password=dev["password"],
+        timeout=timeout,
+        banner_timeout=timeout,
+        auth_timeout=timeout,
+        look_for_keys=False,
+        allow_agent=False,
+    )
+    channel = client.invoke_shell(width=200, height=1000)
+    channel.settimeout(0.0)
+    return SSHSession(channel, client)
+
+
+def read_ssh_banner(host: str, port: int = 22, timeout: float = 8) -> str:
+    """Read the raw SSH identification string, e.g. 'SSH-2.0-OpenSSH_8.9'."""
+    with socket.create_connection((host, int(port)), timeout) as sock:
+        sock.settimeout(timeout)
+        data = b""
+        while b"\n" not in data and len(data) < 512:
+            chunk = sock.recv(128)
+            if not chunk:
+                break
+            data += chunk
+    return data.decode("utf-8", errors="replace").strip()
+
+
+def diagnose_ssh(dev: dict) -> list:
+    """Step-by-step SSH check used by the dashboard's Test button."""
+    steps = []
+    host, port = dev["host"], int(dev.get("port", 22))
+
+    try:
+        with socket.create_connection((host, port), 8):
+            pass
+        steps.append({"step": f"TCP connect to {host}:{port}", "ok": True, "detail": "open"})
+    except Exception as e:
+        steps.append({"step": f"TCP connect to {host}:{port}", "ok": False, "detail": str(e)})
+        return steps
+
+    try:
+        banner = read_ssh_banner(host, port)
+        looks_like_ssh = banner.startswith("SSH-")
+        steps.append({
+            "step": "SSH banner",
+            "ok": looks_like_ssh,
+            "detail": banner or "(no banner received)",
+        })
+        if not looks_like_ssh:
+            return steps
+    except Exception as e:
+        steps.append({"step": "SSH banner", "ok": False, "detail": str(e)})
+        return steps
+
+    if paramiko is None:
+        steps.append({"step": "Paramiko installed", "ok": False,
+                      "detail": "pip install paramiko"})
+        return steps
+
+    session = None
+    try:
+        session = open_ssh_shell(dev)
+        steps.append({"step": "Authentication", "ok": True, "detail": "accepted"})
+        session.write(b"\n")
+        time.sleep(1.2)
+        prompt = session.read_very_eager().decode(errors="ignore").strip()
+        steps.append({
+            "step": "Shell prompt",
+            "ok": bool(prompt),
+            "detail": prompt[-200:] or "(no output)",
+        })
+    except Exception as e:
+        steps.append({"step": "Authentication / shell", "ok": False,
+                      "detail": f"{e.__class__.__name__}: {e}"})
+    finally:
+        if session:
+            session.close()
+    return steps

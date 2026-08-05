@@ -149,7 +149,27 @@ SSH-Router,10.136.110.254,ssh,22,admin,secret,
 
 Older IOS images that only offer legacy SSH key exchange and ciphers are handled automatically.
 
+## FortiGate (FortiOS) devices
+
+FortiGate is **not** Cisco IOS: it has no `terminal monitor`, and it does not push syslog into a CLI session. Those devices are handled differently:
+
+- The vendor is detected from the CLI prompt (e.g. `FortiGate-100F #`), or you can pick **FortiGate** explicitly in the add-device form / a `vendor` column in CSV.
+- Instead of streaming, the FortiOS **event log is polled** every 20 seconds with `execute log display` (read-only, no configuration change).
+- Matched FortiOS events include interface status changes, link monitor changes, and IPsec tunnel-down entries. Adjust `FORTIOS_PATTERNS` in the script to taste.
+
+Memory or disk logging must be enabled on the FortiGate for `execute log display` to return entries — that is the FortiOS default.
+
+For high-volume production use, pointing the FortiGate at a real syslog collector is still the better design; this polling mode exists so you can monitor without changing device configuration.
+
 ### Why a device is not connecting
+
+Press **Test** on any device card. It reports each stage separately, so you can see exactly where it breaks:
+
+```
+OK   — TCP connect to 10.136.110.254:22: open
+OK   — SSH banner: SSH-2.0-OpenSSH_7.4
+FAIL — Authentication / shell: AuthenticationException: Authentication failed.
+```
 
 Each card shows an **Error** line when a connection attempt fails, for example:
 
